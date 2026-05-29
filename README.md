@@ -1,7 +1,7 @@
 # Mistral CLI
 
 A dark, terminal-native desktop client for the Mistral AI API — built with
-Electron and vanilla JavaScript. Inspired by the Claude Code aesthetic:
+Electron and vanilla JavaScript. Inspired by thonny_dev:
 monospace type, minimal chrome, amber (`#FF8205`) used sparingly.
 
 ![Chat](../design_bundle/mistral-cli/project/screenshots/chat-a.png)
@@ -24,7 +24,7 @@ monospace type, minimal chrome, amber (`#FF8205`) used sparingly.
 - **About** — live API status ping, current model + capabilities, keyboard
   reference, and external links.
 - **Command palette** (`Ctrl+K`) and global keyboard shortcuts throughout.
-- **Agent tools (Claude-Code style)** — the model receives a tool catalogue in
+- **Agent tools** — the model receives a tool catalogue in
   its context and acts in a loop: pick a working folder, list/read/write/delete
   files (sandboxed to the chosen folder), create and complete todos, and write
   to long-term memory. Tool calls are parsed from `<action>{…}</action>` blocks,

@@ -6,6 +6,8 @@ const fs = require('fs');
 const Store = require('electron-store');
 const mistral = require('./mistral');
 const agent = require('./agent');
+const tools = require('./tools');
+const { createConsoleManager } = require('./consoles');
 
 const isDev = process.argv.includes('--dev');
 
@@ -22,7 +24,7 @@ const store = new Store({
   defaults: {
     settings: {
       endpoint: mistral.DEFAULT_ENDPOINT,
-      model: 'codestral-latest',
+      model: mistral.DEFAULT_MODEL,
       temperature: 0.7,
       topP: 1,
       maxTokens: 0, // 0 = unlimited
@@ -32,6 +34,8 @@ const store = new Store({
       theme: 'dark',
       fontSize: 14,
       collapseSidebar: false,
+      reasoningLevel: 'medium',
+      aiPermissionMode: 'default',
       activePresetId: 'general'
     },
     sessions: [],
@@ -74,6 +78,18 @@ function defaultPresets() {
 let mainWindow = null;
 // Tracks the in-flight streaming request so it can be aborted.
 let activeController = null;
+// When the agent pauses for a user decision (plan/tool/bash approval), this
+// holds the resolver for the pending promise. Resolved by 'agent:respond'.
+let pendingApproval = null;
+
+/** Resolve any pending approval with the given answer and clear it. */
+function settleApproval(approved) {
+  if (pendingApproval) {
+    const resolve = pendingApproval;
+    pendingApproval = null;
+    resolve(approved);
+  }
+}
 
 /* ------------------------------------------------------------------ *
  *  Long-term memory
@@ -83,7 +99,7 @@ let activeController = null;
  * ------------------------------------------------------------------ */
 const memoryPath = path.join(app.getPath('userData'), 'memory.md');
 const MEMORY_HEADER =
-  '# Mist Desktop — Memory\n\nDurable facts about the user and ongoing work. Edit freely.\n';
+  '# Mist Desktop - Memory\n\nDurable facts about the user and ongoing work. Edit freely.\n';
 
 function ensureMemory() {
   if (!fs.existsSync(memoryPath)) fs.writeFileSync(memoryPath, MEMORY_HEADER, 'utf-8');
@@ -105,33 +121,37 @@ function appendMemory(items) {
 
 /* ------------------------------------------------------------------ *
  *  Agent system prompt
- *  Describes the available tools (Claude-Code style) plus live state:
- *  working folder, open todos, and long-term memory.
  * ------------------------------------------------------------------ */
 const AGENT_INSTRUCTIONS = [
-  'You are Mist Desktop, an agentic assistant that runs on the user\'s computer and can take real actions on their machine, similar to Claude Code.',
+  'You are Mistral Desktop, an agentic assistant that runs on the user\'s computer and can take real actions. You have native function tools for files, the todo list, shell commands, and long-term memory. Call them through the API\'s tool-calling — never write tool calls as plain text.',
   '',
-  'To act, emit one or more action blocks anywhere in your reply, each on its own:',
-  '<action>{"tool":"<name>", ...args}</action>',
-  'The JSON must be valid and on a single logical block. After you emit actions, the system executes them and replies with "Tool results:"; then you continue. When the task is fully done and you have no more actions, reply normally WITHOUT any action block.',
+  'Operating procedure — follow it every time you do real work:',
+  '1. Understand the request. Ask only if you are genuinely blocked.',
+  '2. Explore before changing: use list_files / read_file to learn the actual current state. Never write or edit a file you have not read this session.',
+  '3. Plan: for multi-step work, create todos (add_todo) describing concrete, verifiable steps.',
+  '4. Act in small steps. Prefer edit_file (a targeted snippet replace) over write_file; use write_file only for new files or a full rewrite, and always pass the COMPLETE content.',
+  '5. Verify: after changes, check your work — re-read the file, and when the project supports it, run its tests / build / lint (in a console) and fix any failures. Treat the task as done only once it is verified.',
+  '6. Keep the plan honest: complete_todo each item as you finish it.',
   '',
-  'Available tools:',
-  '- {"tool":"set_working_folder"} — open a dialog asking the user to pick the folder to work in. Do this first if no working folder is set and you need files.',
-  '- {"tool":"list_files","path":"."} — list files and directories (path is relative to the working folder).',
-  '- {"tool":"read_file","path":"src/x.js"} — read a file.',
-  '- {"tool":"write_file","path":"src/x.js","content":"…"} — create or overwrite a file (provide the FULL file content).',
-  '- {"tool":"delete_file","path":"src/x.js"} — delete a file or folder.',
-  '- {"tool":"add_todo","text":"…"} — add a todo item.',
-  '- {"tool":"complete_todo","id":"<id>"} — mark a todo done (id is shown in the todo list).',
-  '- {"tool":"list_todos"} — list current todos.',
-  '- {"tool":"remember","text":"…"} — save a durable fact to long-term memory.',
+  'Tools at a glance:',
+  '- set_working_folder — ask the user to pick the working folder. Do this first if none is set and you need files.',
+  '- list_files / read_file — explore the workspace.',
+  '- write_file — create or fully overwrite a file (full content).',
+  '- edit_file — replace an exact, unique snippet (old_string → new_string) in an existing file. Preferred for edits.',
+  '- delete_file — delete a file or folder.',
+  '- exec_bash — run a single one-shot shell command (fresh process, no state kept).',
+  '- console_open / console_exec / console_close / console_list — persistent shell sessions. Open a console once and run several commands in it; the working directory and environment carry over between commands (unlike exec_bash). Open separate consoles for separate tasks (e.g. a dev server in its own console), and close ones you no longer need. You decide when to open or close them.',
+  '- web_search — search the web for up-to-date information and get result titles, URLs and snippets.',
+  '- web_fetch — open a URL and read its text content (use it after web_search, or directly when you know the URL).',
+  '- add_todo / complete_todo / list_todos — manage the plan.',
+  '- remember — save a durable fact about the user or project.',
   '',
   'Guidelines:',
-  '- All file paths are relative to the working folder; you cannot read or write outside it.',
-  '- For multi-step work, plan with add_todo first and complete_todo each item as you finish it.',
-  '- Save lasting, reusable facts about the user or project with remember. Never mention these mechanisms to the user.',
-  '- Keep narration brief; let the actions do the work.',
-  '- When you reason, wrap it in a collapsible block before the answer or actions, for example:\n<details><summary>Рассуждает</summary>Пользователь сказал ... он скорее всего хочет чтобы я ...</details>'
+  '- All paths are relative to the working folder; you cannot read or write outside it.',
+  '- Prefer a console (console_open + console_exec) when you run several related commands or need state to persist (cd, env, a running dev server); use exec_bash only for a single quick command. Run long-running processes in the background with "&" so the call returns. Close consoles you are done with.',
+  '- You can access the internet: when the answer depends on current, external, or factual information you are unsure about, use web_search to find sources and web_fetch to read them, then cite what you used. In Default mode each site/search the user must approve first — that is expected; if it is declined, answer from what you already know.',
+  '- Be concise in narration; let the tool calls do the work. Never mention these tools or mechanisms to the user by name.',
+  '- When you reason, wrap it in a collapsible block before the answer, for example:\n<details><summary>Рассуждает</summary>Пользователь сказал ... он скорее всего хочет чтобы я ...</details>'
 ].join('\n');
 
 const REASONING_HINTS = {
@@ -140,10 +160,32 @@ const REASONING_HINTS = {
   high: 'Maximize quality and reasoning. Include a detailed "Рассуждает" section with user intent, assumptions, and plan before the answer.'
 };
 
+// Explains the active permission mode so the model knows up-front how its
+// actions will be gated and behaves predictably (the gating itself is enforced
+// by the agent loop, not the model).
+const PERMISSION_MODE_HINTS = {
+  default: [
+    'Permission mode: Default.',
+    'Before performing ANY action that changes files or the system (write_file, edit_file, delete_file, exec_bash, console_exec), you MUST first lay out a plan: call add_todo for each step and nothing else. That plan is shown to the user for approval before the work runs. Read-only exploration (list_files, read_file) does not require a plan.',
+    'Each write_file, edit_file, delete_file, exec_bash and console_exec call is also confirmed by the user individually, and each web_search / web_fetch asks the user before reaching a site. This is expected — proceed normally; if the user rejects something you will be told and should adapt.'
+  ].join('\n'),
+  'tools-bypass': [
+    'Permission mode: Tools Bypass.',
+    'File tools run without confirmation, so you do not need to plan with add_todo first — act directly. Still use todos when they help you track multi-step work.',
+    'Only exec_bash (shell commands) requires the user to confirm before it runs.'
+  ].join('\n'),
+  autopilot: [
+    'Permission mode: Autopilot.',
+    'Every action runs without confirmation. Act autonomously and efficiently, but be careful with irreversible operations (delete_file, overwriting files with write_file, destructive shell commands) — only do them when clearly necessary, and prefer edit_file for changes.'
+  ].join('\n')
+};
+
 /** Build the full agent system message including live state. */
 function buildAgentSystem(settings) {
-  const reasoningLevel = (settings && settings.reasoningLevel) || 'medium';
+  const reasoningLevel = (settings && settingsMistral-Desktop.reasoningLevel) || 'medium';
   const reasoningHint = REASONING_HINTS[reasoningLevel] || REASONING_HINTS.medium;
+  const permMode = (settings && settings.aiPermissionMode) || 'default';
+  const permHint = PERMISSION_MODE_HINTS[permMode] || PERMISSION_MODE_HINTS.default;
   const mem = readMemory().trim();
   const work = store.get('workingDir') || '';
   const todos = store.get('todos') || [];
@@ -152,6 +194,8 @@ function buildAgentSystem(settings) {
     : '(none)';
   return [
     AGENT_INSTRUCTIONS,
+    '',
+    permHint,
     '',
     `Reasoning mode: ${reasoningLevel}`,
     reasoningHint,
@@ -308,6 +352,12 @@ ipcMain.handle('workspace:pick', async () => {
   return res.filePaths[0];
 });
 ipcMain.handle('workspace:clear', () => { store.set('workingDir', ''); return ''; });
+// Set the active working folder to a specific path (used to bind a folder to a
+// chat — restored when a saved session is opened).
+ipcMain.handle('workspace:set', (_e, dir) => {
+  store.set('workingDir', dir || '');
+  return store.get('workingDir') || '';
+});
 
 // Todos (shared between the agent and the UI).
 ipcMain.handle('todos:get', () => store.get('todos') || []);
@@ -319,6 +369,12 @@ ipcMain.handle('todos:toggle', (_e, id) => {
   return todos;
 });
 ipcMain.handle('todos:clear', () => { store.set('todos', []); return []; });
+// Replace the active todo list (used to bind todos to a chat — restored when a
+// saved session is opened, cleared for a new chat).
+ipcMain.handle('todos:set', (_e, todos) => {
+  store.set('todos', Array.isArray(todos) ? todos : []);
+  return store.get('todos') || [];
+});
 
 // API key gets its own channels so the encrypted value never leaves main verbatim.
 ipcMain.handle('apikey:get', () => getApiKey());
@@ -350,6 +406,7 @@ ipcMain.on('mistral:send', async (event, { messages }) => {
 
   // Abort any prior in-flight request before starting a new one.
   if (activeController) activeController.abort();
+  settleApproval(false); // drop any approval left dangling by the previous run
   activeController = new AbortController();
   const controller = activeController;
 
@@ -357,10 +414,20 @@ ipcMain.on('mistral:send', async (event, { messages }) => {
     if (!event.sender.isDestroyed()) event.sender.send('mistral:stream', msg);
   };
 
+  // Pause the agent loop until the renderer answers the approval request.
+  // Resolved by the 'agent:respond' channel (or false on abort/new request).
+  const requestApproval = (payload) => {
+    reply(payload);
+    return new Promise((resolve) => { pendingApproval = resolve; });
+  };
+
   // Prepend the agent system message (tools + live state) so the model always
   // knows what it can do and what the current context is.
   const baseMessages = [{ role: 'system', content: buildAgentSystem(settings) }, ...messages];
-  const ctx = { store, getWindow: () => mainWindow, appendMemory };
+  // Persistent shell sessions scoped to this request — closed when it finishes
+  // so no shells leak between messages.
+  const consoles = createConsoleManager();
+  const ctx = { store, getWindow: () => mainWindow, appendMemory, signal: controller.signal, consoles };
 
   try {
     await agent.run({
@@ -369,17 +436,33 @@ ipcMain.on('mistral:send', async (event, { messages }) => {
       apiKey,
       signal: controller.signal,
       emit: reply,
+      requestApproval,
       ctx
     });
   } catch (err) {
     reply({ type: 'error', message: err.message, code: err.code || 'unknown' });
   } finally {
+    consoles.closeAll();
     if (activeController === controller) activeController = null;
   }
 });
 
 ipcMain.on('mistral:abort', () => {
   if (activeController) activeController.abort();
+  settleApproval(false); // unblock the loop if it's waiting on approval
+});
+
+// Renderer's answer to a pending plan/tool/bash approval request.
+ipcMain.on('agent:respond', (_e, approved) => settleApproval(Boolean(approved)));
+
+// Sizes (in characters) of the fixed parts of the context window — the system
+// prompt and the tool schemas — so the renderer can show a usage breakdown.
+ipcMain.handle('context:stats', () => {
+  const settings = store.get('settings');
+  return {
+    systemChars: buildAgentSystem(settings).length,
+    toolsChars: JSON.stringify(tools.TOOL_SCHEMAS).length
+  };
 });
 
 ipcMain.handle('mistral:test', async () => {

@@ -103,8 +103,7 @@ function renderNav() {
   els.nav.innerHTML = `
     <div class="nav-head">
       <div class="nav-brand">
-        <span class="glyph"></span>
-        <span class="name">mistral<span class="cli">cli</span></span>
+        <span class="name">✦ Mistral<span class="cli">Desktop</span></span>
       </div>
       <button class="btn primary nav-newchat" id="navNew"><span class="label">+ New Chat</span></button>
       <div class="nav-sessions" id="navSessions"></div>
@@ -112,9 +111,8 @@ function renderNav() {
     <div class="spacer"></div>
     <div class="nav-foot">
       <button class="nav-menu-trigger" id="navMenu" title="Menu">
-        <span class="avatar"></span>
         <div class="meta">
-          <div class="l1">Mist Desktop</div>
+          <div class="l1">Mistral Desktop</div>
           <div class="l2">menu</div>
         </div>
         <svg class="caret" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 10l4-4 4 4"/></svg>

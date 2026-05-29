@@ -205,6 +205,91 @@ select.field-box { appearance: none; cursor: pointer; background-image: none; }
 .todo-item.done .todo-text { color: var(--ink-4); text-decoration: line-through; }
 .todo-empty { padding: 18px 14px; font-size: 12px; color: var(--ink-3); line-height: 1.5; }
 
+/* ai permission mode popover */
+.ai-perm-pop {
+  position: fixed; min-width: 300px; max-width: 380px; z-index: 120;
+  background: var(--panel-2); border: 1px solid var(--line-strong); border-radius: 8px;
+  box-shadow: 0 18px 44px -18px rgba(0, 0, 0, .85); overflow: hidden; animation: paletteIn .12s ease;
+}
+.ai-perm-head { padding: 12px 14px; border-bottom: 1px solid var(--line); font-weight: 600; font-size: 11px; }
+.ai-perm-list { padding: 6px; max-height: 380px; overflow-y: auto; }
+.ai-perm-item {
+  padding: 10px 12px; border-radius: var(--r); margin-bottom: 6px;
+  background: var(--panel-3); border: 1px solid transparent; cursor: pointer;
+  transition: all .12s;
+}
+.ai-perm-item:hover { background: var(--panel); border-color: var(--line); }
+.ai-perm-item.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.ai-perm-item .ai-perm-label { font-weight: 600; font-size: 12px; color: var(--ink); margin-bottom: 4px; }
+.ai-perm-item .ai-perm-desc { font-size: 11px; color: var(--ink-3); line-height: 1.4; }
+
+/* ai permission chip in the composer bar (sized like the token meta) */
+.perm-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 11px; color: var(--ink-3);
+  padding: 3px 8px; border: 1px solid var(--line); border-radius: 100px;
+  background: transparent; cursor: pointer; transition: all .12s;
+}
+.perm-chip:hover { border-color: var(--line-strong); color: var(--ink); }
+.perm-chip .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); flex: none; }
+
+/* context-window gauge (ring + %) in the composer bar */
+.ctx-gauge {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: transparent; border: 0; padding: 2px 4px; cursor: pointer;
+  color: var(--ink-3); transition: color .12s;
+}
+.ctx-gauge:hover { color: var(--ink); }
+.ctx-gauge svg { width: 16px; height: 16px; transform: rotate(-90deg); flex: none; }
+.ctx-gauge .track { fill: none; stroke: var(--line-2); stroke-width: 2.5; }
+.ctx-gauge .fill {
+  fill: none; stroke: var(--accent); stroke-width: 2.5; stroke-linecap: round;
+  stroke-dasharray: 43.98; stroke-dashoffset: 43.98; transition: stroke-dashoffset .25s ease, stroke .2s;
+}
+.ctx-gauge.warn .fill { stroke: #e0a800; }
+.ctx-gauge.crit .fill { stroke: var(--danger); }
+.ctx-gauge .ctx-pct { font-size: 11px; }
+
+/* context-window usage popover */
+.ctx-pop {
+  position: fixed; min-width: 280px; max-width: 340px; z-index: 120;
+  background: var(--panel-2); border: 1px solid var(--line-strong); border-radius: 8px;
+  box-shadow: 0 18px 44px -18px rgba(0, 0, 0, .85); overflow: hidden; animation: paletteIn .12s ease;
+}
+.ctx-pop .ctx-head { padding: 12px 14px; border-bottom: 1px solid var(--line); }
+.ctx-pop .ctx-body { padding: 12px 14px; }
+.ctx-pop .ctx-bar { height: 6px; border-radius: 100px; background: var(--panel-3); overflow: hidden; margin-bottom: 8px; }
+.ctx-pop .ctx-bar .fill { height: 100%; background: var(--accent); border-radius: 100px; transition: width .25s ease; }
+.ctx-pop .ctx-bar .fill.warn { background: #e0a800; }
+.ctx-pop .ctx-bar .fill.crit { background: var(--danger); }
+.ctx-pop .ctx-total { font-size: 11px; color: var(--ink-2); margin-bottom: 12px; }
+.ctx-pop .ctx-group-title {
+  font-family: var(--mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--ink-4); margin: 12px 0 6px;
+}
+.ctx-pop .ctx-group-title:first-of-type { margin-top: 0; }
+.ctx-pop .ctx-row { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--ink-2); padding: 3px 0; }
+.ctx-pop .ctx-row .mono { color: var(--ink); font-size: 11px; }
+
+/* inline approval card (plan / tool / bash confirmation) */
+.approval-card {
+  align-self: stretch; max-width: 680px;
+  background: var(--panel-2); border: 1px solid var(--line-strong); border-radius: 10px;
+  padding: 14px 16px; box-shadow: 0 14px 40px -20px rgba(0, 0, 0, .8);
+  animation: paletteIn .14s ease;
+}
+.approval-card .approval-head { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; }
+.approval-card .approval-glyph { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 16%, transparent); }
+.approval-card .approval-title { font-weight: 600; font-size: 13px; color: var(--ink); }
+.approval-card .approval-body { font-size: 12.5px; color: var(--ink-2); line-height: 1.5; margin-bottom: 12px; }
+.approval-card .approval-body code { font-family: var(--mono); font-size: 11.5px; background: var(--panel-3); padding: 1px 5px; border-radius: 4px; color: var(--ink); }
+.approval-card .approval-code {
+  margin: 0 0 12px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; overflow-x: auto; font-family: var(--mono); font-size: 12px; color: var(--ink);
+  white-space: pre-wrap; word-break: break-word;
+}
+.approval-card .approval-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
 .thread { flex: 1; padding: 22px 20px; display: flex; flex-direction: column; gap: 22px; overflow-y: auto; }
 
 /* message bubbles */

@@ -3,9 +3,34 @@
  * abortable generation, token counter, smart auto-scroll, and history
  * persistence. */
 import {
-  store, getSettings, renderMarkdown, bindCopyButtons, escapeHtml,
-  estimateTokens, formatRelative, uid, toast, stripAgentTags
+  store, getSettings, saveSettings, renderMarkdown, bindCopyButtons, escapeHtml,
+  estimateTokens, formatRelative, uid, toast, stripAgentTags, confirmDialog
 } from '../shared.js';
+
+/* AI permission modes — labels + descriptions shown in the picker. */
+const PERM_MODES = [
+  { id: 'default', label: 'Default', desc: 'Подтверждение плана и важных инструментов' },
+  { id: 'tools-bypass', label: 'Tools Bypass', desc: 'Инструменты без подтверждения, bash — с подтверждением' },
+  { id: 'autopilot', label: 'Autopilot (Beta)', desc: 'Без подтверждений · ранний доступ' }
+];
+const permLabel = (id) => (PERM_MODES.find((m) => m.id === id) || PERM_MODES[0]).label;
+
+/* Approximate context-window sizes (in tokens) per model, for the usage gauge. */
+const CONTEXT_LIMITS = {
+  'mistral-large-latest': 262144,
+  'mistral-medium-latest': 131072,
+  'mistral-small-latest': 131072,
+  'magistral-medium-latest': 131072,
+  'magistral-small-latest': 131072,
+  'codestral-latest': 262144,
+  'devstral-medium-latest': 131072,
+  'ministral-8b-latest': 131072,
+  'pixtral-large-latest': 131072,
+  'open-mistral-nemo': 131072
+};
+const ctxLimitFor = (model) => CONTEXT_LIMITS[model] || 131072;
+/* Token counts of the fixed context parts (system prompt + tool schemas). */
+let ctxBaseline = { system: 0, tools: 0 };
 
 const api = window.api;
 
@@ -16,7 +41,7 @@ let unsubStream = null;
 let autoScroll = true;
 
 function freshConvo(model) {
-  return { id: uid(), title: '', model, createdAt: Date.now(), messages: [], savedId: null };
+  return { id: uid(), title: '', model, createdAt: Date.now(), messages: [], savedId: null, workingDir: '', todos: [] };
 }
 
 /* ---------------- session persistence ---------------- */
@@ -36,7 +61,9 @@ async function persistConvo() {
     createdAt: convo.createdAt,
     updatedAt: Date.now(),
     messageCount: convo.messages.length,
-    messages: convo.messages
+    messages: convo.messages,
+    workingDir: convo.workingDir || '',
+    todos: convo.todos || []
   };
   const sessions = await loadSessions();
   const idx = sessions.findIndex((s) => s.id === record.id);
@@ -65,6 +92,11 @@ async function render(container, ctx) {
       await openSession(openSessionParam, false);
     }
   }
+
+  // Bind the working folder + todos to the current chat: make the active state
+  // match this conversation (empty for a fresh chat, restored for a saved one).
+  await api.workspace.set(convo.workingDir || '');
+  await api.todos.set(convo.todos || []);
 
   const preset = await activePreset(settings);
 
@@ -97,6 +129,16 @@ async function render(container, ctx) {
             <span class="meta mono">↵ send</span>
             <span class="meta mono">·  ${escapeHtml((convo.model || '').replace('-latest', ''))}</span>
             <span class="meta mono" id="tokMeta">·  0 tok</span>
+            <button class="ctx-gauge" id="ctxGauge" title="Контекстное окно">
+              <svg viewBox="0 0 18 18" aria-hidden="true">
+                <circle class="track" cx="9" cy="9" r="7"></circle>
+                <circle class="fill" cx="9" cy="9" r="7"></circle>
+              </svg>
+              <span class="ctx-pct mono" id="ctxPct">0%</span>
+            </button>
+            <button class="perm-chip mono" id="aiPermBtn" title="Права ИИ">
+              <span class="dot"></span><span id="aiPermLabel">${escapeHtml(permLabel(settings.aiPermissionMode))}</span>
+            </button>
             <span class="spacer"></span>
             <button class="btn ghost sm hidden" id="stopBtn">Stop ⎋</button>
             <button class="btn primary sm" id="sendBtn">Send ↵</button>
@@ -111,6 +153,10 @@ async function render(container, ctx) {
   const sendBtn = container.querySelector('#sendBtn');
   const stopBtn = container.querySelector('#stopBtn');
   const tokMeta = container.querySelector('#tokMeta');
+  const ctxGauge = container.querySelector('#ctxGauge');
+  const ctxPct = container.querySelector('#ctxPct');
+  const ctxFill = ctxGauge.querySelector('.fill');
+  const RING = 2 * Math.PI * 7; // circumference of the gauge ring (r=7)
 
   // Track manual scrolling so streaming doesn't yank the view down.
   thread.addEventListener('scroll', () => {
@@ -118,12 +164,50 @@ async function render(container, ctx) {
     autoScroll = nearBottom;
   });
 
+  // Break the current context window into buckets (tokens). Tool result lines
+  // in assistant messages render as `> \`tool\` — summary` blockquotes, so we
+  // split assistant text into "messages" vs "tool results".
+  const contextBreakdown = () => {
+    let msgChars = composer.value.length;
+    let toolChars = 0;
+    for (const m of convo.messages) {
+      if (m.role === 'assistant') {
+        for (const ln of (m.content || '').split('\n')) {
+          if (/^>\s*`[^`]+`/.test(ln.trim())) toolChars += ln.length + 1;
+          else msgChars += ln.length + 1;
+        }
+      } else {
+        msgChars += (m.content || '').length;
+      }
+    }
+    const tok = (c) => Math.ceil(c / 4);
+    const messages = tok(msgChars);
+    const toolResults = tok(toolChars);
+    const total = ctxBaseline.system + ctxBaseline.tools + messages + toolResults;
+    return { system: ctxBaseline.system, tools: ctxBaseline.tools, messages, toolResults, total };
+  };
+
   // Composer behaviour: Enter sends, Shift+Enter newlines; autosize; token count.
   const updateTokens = () => {
-    const ctxTokens = estimateTokens(convo.messages.map((m) => m.content).join(' '));
-    const inputTokens = estimateTokens(composer.value);
-    tokMeta.textContent = `·  ${(ctxTokens + inputTokens).toLocaleString()} tok`;
+    const b = contextBreakdown();
+    tokMeta.textContent = `·  ${b.total.toLocaleString()} tok`;
+    const pct = Math.min(1, b.total / ctxLimitFor(convo.model));
+    ctxFill.style.strokeDasharray = RING.toFixed(2);
+    ctxFill.style.strokeDashoffset = (RING * (1 - pct)).toFixed(2);
+    ctxPct.textContent = `${Math.round(pct * 100)}%`;
+    ctxGauge.classList.toggle('warn', pct >= 0.8 && pct < 0.95);
+    ctxGauge.classList.toggle('crit', pct >= 0.95);
   };
+
+  // System prompt + tool schemas are fixed parts of the window; fetch their
+  // sizes from main and refresh the gauge.
+  async function refreshCtxBaseline() {
+    try {
+      const s = await api.context.stats();
+      ctxBaseline = { system: Math.ceil((s.systemChars || 0) / 4), tools: Math.ceil((s.toolsChars || 0) / 4) };
+    } catch { /* keep previous baseline */ }
+    updateTokens();
+  }
   composer.addEventListener('input', () => {
     composer.style.height = 'auto';
     composer.style.height = Math.min(220, composer.scrollHeight) + 'px';
@@ -148,30 +232,49 @@ async function render(container, ctx) {
 
   async function refreshFolder() {
     const dir = await api.workspace.get();
+    // Keep the conversation's folder in sync (e.g. when the agent picks one).
+    convo.workingDir = dir || '';
     folderLabel.textContent = dir ? dir.split(/[\\/]/).pop() : 'Set folder';
     container.querySelector('#folderBtn').classList.toggle('set', !!dir);
     container.querySelector('#folderBtn').title = dir || 'Choose a working folder';
   }
   async function refreshTodos() {
     const todos = await api.todos.get();
+    // Keep the conversation's todos in sync (the agent mutates them mid-run).
+    convo.todos = todos;
     const done = todos.filter((t) => t.done).length;
     todosLabel.textContent = todos.length ? `Todos ${done}/${todos.length}` : 'Todos';
     container.querySelector('#todosBtn').classList.toggle('set', todos.length > 0);
   }
 
   container.querySelector('#folderBtn').addEventListener('click', async () => {
-    await api.workspace.pick();
+    const dir = await api.workspace.pick();
+    convo.workingDir = dir || '';
     await refreshFolder();
+    await persistConvo(); // remember the folder on this chat
   });
   container.querySelector('#todosBtn').addEventListener('click', (e) => {
     e.stopPropagation();
     toggleTodosPopover(container, refreshTodos);
   });
 
+  // AI Permission Mode button
+  container.querySelector('#aiPermBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleAiPermPopover(container);
+  });
+
+  // Context-window gauge → usage breakdown popover.
+  ctxGauge.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleCtxPopover(container, contextBreakdown(), ctxLimitFor(convo.model));
+  });
+
   // Initial paint.
   paintThread(thread);
   await refreshFolder();
   await refreshTodos();
+  await refreshCtxBaseline();
   updateTokens();
   reflectStreamingUI();
   setTimeout(() => composer.focus(), 60);
@@ -217,6 +320,7 @@ async function render(container, ctx) {
       rafPending = false;
       asstMsg.content = display();
       updateLastAssistant(thread, asstMsg.content, true);
+      updateTokens(); // keep the context gauge live as tokens stream in
       if (autoScroll) forceScroll(thread);
     };
     const scheduleFlush = () => { if (!rafPending) { rafPending = true; requestAnimationFrame(flush); } };
@@ -238,12 +342,40 @@ async function render(container, ctx) {
       } else if (msg.type === 'tool-start') {
         // Optimistic "running" line could go here; we render the result line below.
       } else if (msg.type === 'tool') {
-        // Append a Claude-Code-style tool line as a markdown blockquote.
+        // Append a tool line as a markdown blockquote.
         const mark = msg.ok === false ? '⚠' : '✓';
         committed += `\n\n> \`${escapeHtml(msg.name)}\` — ${escapeHtml(msg.summary || (msg.ok ? 'done' : 'failed'))} ${mark}`;
         if (msg.todosChanged) refreshTodos();
         if (msg.workspaceChanged) refreshFolder();
         scheduleFlush();
+      } else if (msg.type === 'plan-review-required') {
+        showApprovalCard(thread, {
+          kind: 'plan',
+          title: 'Утвердить план?',
+          body: `ИИ составил план из ${msg.todoCount} шаг(ов). Откройте «Todos» сверху, чтобы посмотреть детали.`,
+          okText: 'Выполнить план'
+        });
+      } else if (msg.type === 'bash-confirmation-required') {
+        showApprovalCard(thread, {
+          kind: 'bash',
+          title: 'Выполнить команду?',
+          code: msg.command,
+          okText: 'Выполнить'
+        });
+      } else if (msg.type === 'web-confirmation-required') {
+        showApprovalCard(thread, {
+          kind: 'web',
+          title: 'Выйти в интернет?',
+          body: `ИИ хочет обратиться к интернету: <code>${escapeHtml(msg.target || '')}</code>`,
+          okText: 'Разрешить'
+        });
+      } else if (msg.type === 'tool-confirmation-required') {
+        showApprovalCard(thread, {
+          kind: 'tool',
+          title: 'Разрешить действие?',
+          body: `ИИ хочет выполнить <code>${escapeHtml(msg.toolName)}</code>${msg.path ? ` · ${escapeHtml(msg.path)}` : ''}`,
+          okText: 'Разрешить'
+        });
       } else if (msg.type === 'done') {
         finish(msg.aborted, msg.content);
       } else if (msg.type === 'error') {
@@ -253,15 +385,18 @@ async function render(container, ctx) {
 
     api.mistral.send({ messages: outgoing });
 
-    function finish(aborted) {
+    function finish(aborted, content) {
       cleanupStream();
       commitTurn(); // fold in any trailing final-turn text
       asstMsg.content = committed.trim();
+      // Fall back to the loop's closing message (e.g. plan rejected) when no
+      // visible text streamed in this turn.
+      if (!asstMsg.content && content) asstMsg.content = content.trim();
       if (!asstMsg.content && aborted) convo.messages.pop(); // nothing produced
-      updateTokens();
       paintThread(thread);
       persistConvo();
       refreshTodos();
+      refreshCtxBaseline(); // todos/folder may have changed → system prompt size too
       if (aborted) toast('Generation stopped', 'info', 2000);
     }
     function finishError(message) {
@@ -282,6 +417,7 @@ async function render(container, ctx) {
 
   function cleanupStream() {
     streaming = false;
+    removeApprovalCard();
     if (unsubStream) { unsubStream(); unsubStream = null; }
     reflectStreamingUI();
     composer.focus();
@@ -301,7 +437,6 @@ function paintThread(thread, streamingLast = false) {
   if (!convo.messages.length) {
     thread.innerHTML = `
       <div class="empty">
-        <div class="glyph"><svg viewBox="0 0 16 16"><path d="M3 5.5h10v6H7l-2 2v-2H3z" stroke-width="1.4"/></svg></div>
         <div class="title">Start a conversation</div>
         <div class="sub">Ask Mistral anything. Your messages stream back token-by-token, with markdown and syntax highlighting.</div>
       </div>`;
@@ -331,11 +466,48 @@ function updateLastAssistant(thread, text, withCursor) {
 
 function forceScroll(thread) { thread.scrollTop = thread.scrollHeight; }
 
+/* ---------------- approval card (plan / tool / bash confirmation) ---------------- */
+let approvalCard = null;
+function removeApprovalCard() {
+  approvalCard?.remove();
+  approvalCard = null;
+}
+/** Render an inline approval prompt and resolve via api.mistral.respond(). */
+function showApprovalCard(thread, { kind, title, body, code, okText }) {
+  removeApprovalCard(); // only one decision at a time
+  const card = document.createElement('div');
+  card.className = `approval-card ${kind}`;
+  card.innerHTML = `
+    <div class="approval-head">
+      <span class="approval-glyph"></span>
+      <span class="approval-title">${escapeHtml(title)}</span>
+    </div>
+    ${code ? `<pre class="approval-code"><code>${escapeHtml(code)}</code></pre>` : ''}
+    ${body ? `<div class="approval-body">${body}</div>` : ''}
+    <div class="approval-actions">
+      <button class="btn ghost sm" data-act="reject">Отклонить</button>
+      <button class="btn primary sm" data-act="approve">${escapeHtml(okText || 'Разрешить')}</button>
+    </div>`;
+  thread.appendChild(card);
+  approvalCard = card;
+  forceScroll(thread);
+
+  const respond = (approved) => {
+    removeApprovalCard();
+    api.mistral.respond(approved);
+  };
+  card.querySelector('[data-act="approve"]').addEventListener('click', () => respond(true));
+  card.querySelector('[data-act="reject"]').addEventListener('click', () => respond(false));
+}
+
 /* ---------------- conversation transitions ---------------- */
 async function newChat(repaint = true) {
   await persistConvo();
   const settings = await getSettings();
   convo = freshConvo(settings.model || 'mistral-large-latest');
+  // A new chat starts with no working folder and no todos bound to it.
+  await api.workspace.set('');
+  await api.todos.set([]);
   if (repaint) {
     const thread = document.querySelector('#thread');
     if (thread) paintThread(thread);
@@ -350,8 +522,13 @@ async function openSession(session, repaint = true) {
     title: session.title,
     model: session.model,
     createdAt: session.createdAt,
-    messages: session.messages.map((m) => ({ role: m.role, content: m.content }))
+    messages: session.messages.map((m) => ({ role: m.role, content: m.content })),
+    workingDir: session.workingDir || '',
+    todos: session.todos || []
   };
+  // Restore this chat's working folder + todos as the active state.
+  await api.workspace.set(convo.workingDir);
+  await api.todos.set(convo.todos);
   if (repaint) {
     const thread = document.querySelector('#thread');
     if (thread) paintThread(thread);
@@ -414,10 +591,111 @@ async function toggleTodosPopover(container, onChange) {
   setTimeout(() => document.addEventListener('click', onDocClickTodos), 0);
 }
 
+/* ---------------- ai permission mode popover ---------------- */
+let aiPermPop = null;
+function closeAiPermPopover() {
+  aiPermPop?.remove();
+  aiPermPop = null;
+  document.removeEventListener('click', onDocClickAiPerm);
+}
+function onDocClickAiPerm(e) {
+  if (!e.target.closest('#aiPermPop') && !e.target.closest('#aiPermBtn')) closeAiPermPopover();
+}
+async function toggleAiPermPopover(container) {
+  if (aiPermPop) { closeAiPermPopover(); return; }
+  const anchor = container.querySelector('#aiPermBtn');
+  const settings = await getSettings();
+
+  aiPermPop = document.createElement('div');
+  aiPermPop.id = 'aiPermPop';
+  aiPermPop.className = 'ai-perm-pop';
+  aiPermPop.innerHTML = `
+    <div class="ai-perm-head"><span class="lbl">Права ИИ</span></div>
+    <div class="ai-perm-list">
+      ${PERM_MODES.map((m) => `
+        <div class="ai-perm-item ${m.id === settings.aiPermissionMode ? 'active' : ''}" data-mode="${m.id}">
+          <div class="ai-perm-label">${escapeHtml(m.label)}</div>
+          <div class="ai-perm-desc">${escapeHtml(m.desc)}</div>
+        </div>`).join('')}
+    </div>`;
+
+  // Position above the anchor (the chip sits at the bottom of the screen).
+  const r = anchor.getBoundingClientRect();
+  document.getElementById('overlayHost').appendChild(aiPermPop);
+  aiPermPop.style.bottom = `${window.innerHeight - r.top + 6}px`;
+  aiPermPop.style.left = `${r.left}px`;
+
+  aiPermPop.querySelectorAll('.ai-perm-item').forEach((el) =>
+    el.addEventListener('click', async () => {
+      const mode = el.dataset.mode;
+      // Autopilot is an early-access mode — warn before enabling it.
+      if (mode === 'autopilot') {
+        const ok = await confirmDialog({
+          title: 'Включить Autopilot (Beta)?',
+          body: 'В этом режиме ИИ выполняет действия и команды без подтверждения. Это ранний доступ — используйте на свой риск.',
+          confirmText: 'Включить',
+          danger: true
+        });
+        if (!ok) return;
+      }
+      await saveSettings({ aiPermissionMode: mode });
+      const label = container.querySelector('#aiPermLabel');
+      if (label) label.textContent = permLabel(mode);
+      toast(`Режим: ${permLabel(mode)}`, 'info', 1800);
+      closeAiPermPopover();
+    }));
+
+  setTimeout(() => document.addEventListener('click', onDocClickAiPerm), 0);
+}
+
+/* ---------------- context-window usage popover ---------------- */
+let ctxPop = null;
+function closeCtxPopover() {
+  ctxPop?.remove();
+  ctxPop = null;
+  document.removeEventListener('click', onDocClickCtx);
+}
+function onDocClickCtx(e) {
+  if (!e.target.closest('#ctxPop') && !e.target.closest('#ctxGauge')) closeCtxPopover();
+}
+function toggleCtxPopover(container, b, limit) {
+  if (ctxPop) { closeCtxPopover(); return; }
+  const anchor = container.querySelector('#ctxGauge');
+  const pct = Math.min(100, Math.round((b.total / limit) * 100));
+  const tk = (n) => `${n.toLocaleString()} ток.`;
+  const row = (label, value) => `<div class="ctx-row"><span>${label}</span><span class="mono">${tk(value)}</span></div>`;
+
+  ctxPop = document.createElement('div');
+  ctxPop.id = 'ctxPop';
+  ctxPop.className = 'ctx-pop';
+  ctxPop.innerHTML = `
+    <div class="ctx-head"><span class="lbl">Контекстное окно</span></div>
+    <div class="ctx-body">
+      <div class="ctx-bar"><div class="fill ${pct >= 95 ? 'crit' : pct >= 80 ? 'warn' : ''}" style="width:${pct}%"></div></div>
+      <div class="ctx-total mono">${b.total.toLocaleString()} / ${limit.toLocaleString()} ток. · ${pct}%</div>
+      <div class="ctx-group-title">Система</div>
+      ${row('Системные инструкции', b.system)}
+      ${row('Объяснение инструментов', b.tools)}
+      <div class="ctx-group-title">Пользовательский контекст</div>
+      ${row('Сообщений', b.messages)}
+      ${row('Результат инструментов', b.toolResults)}
+    </div>`;
+
+  // Position above the gauge.
+  const r = anchor.getBoundingClientRect();
+  document.getElementById('overlayHost').appendChild(ctxPop);
+  ctxPop.style.bottom = `${window.innerHeight - r.top + 6}px`;
+  ctxPop.style.left = `${r.left}px`;
+
+  setTimeout(() => document.addEventListener('click', onDocClickCtx), 0);
+}
+
 /* ---------------- lifecycle ---------------- */
 function destroy() {
   if (chatPage._onKey) { document.removeEventListener('keydown', chatPage._onKey); chatPage._onKey = null; }
   closeTodosPopover();
+  closeAiPermPopover();
+  closeCtxPopover();
   // Note: we intentionally keep an active stream alive so it survives a quick
   // page switch; the subscription closes itself on done/error.
 }

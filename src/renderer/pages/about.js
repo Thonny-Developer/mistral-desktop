@@ -20,7 +20,7 @@ const SHORTCUTS = [
 
 const LINKS = [
   ['Docs ↗', 'https://docs.mistral.ai/'],
-  ['GitHub ↗', 'https://github.com/mistralai'],
+  ['GitHub ↗', 'https://github.com/Thonny-Developer'],
   ['Changelog ↗', 'https://docs.mistral.ai/getting-started/changelog/']
 ];
 
@@ -33,9 +33,8 @@ async function render(container) {
     <div class="about scroll">
       <div class="about-inner">
         <div class="about-id">
-          <span class="logo"></span>
           <div>
-            <div class="name">Mistral CLI</div>
+            <div class="name">Mistral Desktop</div>
             <div class="ver mono">v${APP_VERSION} · electron</div>
           </div>
         </div>

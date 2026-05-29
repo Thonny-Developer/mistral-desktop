@@ -13,13 +13,24 @@
 
 const DEFAULT_ENDPOINT = 'https://api.mistral.ai/v1';
 
-// The four models the client officially supports (see Settings page).
+// Models the client officially supports (see Settings page). These are the
+// official `-latest` aliases from https://docs.mistral.ai/getting-started/models —
+// the API always resolves them to the current dated snapshot.
 const SUPPORTED_MODELS = [
-  'mistral-small-latest',
-  'mistral-medium-latest',
   'mistral-large-latest',
-  'codestral-latest'
+  'mistral-medium-latest',
+  'mistral-small-latest',
+  'magistral-medium-latest',
+  'magistral-small-latest',
+  'codestral-latest',
+  'devstral-medium-latest',
+  'ministral-8b-latest',
+  'pixtral-large-latest',
+  'open-mistral-nemo'
 ];
+
+/** Fallback model when settings don't specify one. */
+const DEFAULT_MODEL = 'codestral-latest';
 
 /** Build a tagged error so the renderer can branch on `.code`. */
 function apiError(message, code) {
@@ -64,9 +75,10 @@ function errorForStatus(status, bodyText) {
  * @param {string}   opts.apiKey         Decrypted API key.
  * @param {Function} opts.onToken        Called with each text delta.
  * @param {AbortSignal} opts.signal      Abort signal for the Stop button.
- * @returns {Promise<{content:string, usage:Object|null}>}
+ * @param {Array}    opts.tools          Optional tool/function schemas for native tool-calling.
+ * @returns {Promise<{content:string, toolCalls:Array, usage:Object|null}>}
  */
-async function sendMessage({ messages, settings, apiKey, onToken, signal }) {
+async function sendMessage({ messages, settings, apiKey, onToken, signal, tools }) {
   if (!apiKey) throw apiError('No API key configured. Add one in Settings.', 'auth');
 
   const endpoint = settings.endpoint || DEFAULT_ENDPOINT;
@@ -79,13 +91,29 @@ async function sendMessage({ messages, settings, apiKey, onToken, signal }) {
   };
   const qualitySettings = QUALITY_SAMPLING[qualityMode] || QUALITY_SAMPLING.medium;
 
+  const hasTools = Array.isArray(tools) && tools.length > 0;
+  // Tool-using turns want determinism over creativity — cap the temperature so
+  // file paths, edits and commands come out predictable run-to-run.
+  const temperature = hasTools
+    ? Math.min(clampNum(qualitySettings.temperature, 0, 1.5, 0.7), 0.3)
+    : clampNum(qualitySettings.temperature, 0, 1.5, 0.7);
+
+  // Use exactly the model the user selected. Only fall back when it's missing
+  // entirely — never silently swap a valid choice for a different model.
+  const model = (typeof settings.model === 'string' && settings.model.trim())
+    ? settings.model.trim()
+    : DEFAULT_MODEL;
   const body = {
-    model: settings.model || 'codestral-latest',
+    model,
     messages,
-    temperature: clampNum(qualitySettings.temperature, 0, 1.5, 0.7),
+    temperature,
     top_p: clampNum(qualitySettings.top_p, 0, 1, 1),
     stream
   };
+  if (hasTools) {
+    body.tools = tools;
+    body.tool_choice = 'auto';
+  }
   // max_tokens is optional — only send a positive integer.
   const maxTokens = parseInt(settings.maxTokens, 10);
   if (Number.isFinite(maxTokens) && maxTokens > 0) body.max_tokens = maxTokens;
@@ -115,22 +143,41 @@ async function sendMessage({ messages, settings, apiKey, onToken, signal }) {
   // Non-streaming path: parse a single JSON payload.
   if (!stream) {
     const data = await res.json();
-    const content = data?.choices?.[0]?.message?.content || '';
+    const msg = data?.choices?.[0]?.message || {};
+    const content = msg.content || '';
     if (onToken && content) onToken(content);
-    return { content, usage: data?.usage || null };
+    const toolCalls = (msg.tool_calls || []).map((tc, i) => parseToolCall(tc.id || `call_${i}`, tc.function?.name, tc.function?.arguments));
+    return { content, toolCalls, usage: data?.usage || null };
   }
 
   // Streaming path: parse SSE frames as they arrive.
   return await parseSSE(res, onToken);
 }
 
-/** Read the SSE body, emit deltas via onToken, resolve with the full text + usage. */
+/** Finalise an accumulated tool call: parse its JSON arguments (or flag error). */
+function parseToolCall(id, name, rawArgs) {
+  const raw = (rawArgs == null || rawArgs === '') ? '{}' : String(rawArgs);
+  let args = {};
+  let error = null;
+  try { args = JSON.parse(raw); } catch (e) { error = e.message; }
+  return { id, name, args, rawArguments: raw, error };
+}
+
+/** Read the SSE body, emit text deltas via onToken, accumulate tool calls. */
 async function parseSSE(res, onToken) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder('utf-8');
   let buffer = '';
   let full = '';
   let usage = null;
+  // tool_calls stream in fragments keyed by index: id/name arrive once, the
+  // JSON `arguments` string is concatenated across deltas.
+  const toolAcc = new Map();
+
+  const finalize = () => [...toolAcc.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, s]) => parseToolCall(s.id || `call_${s.index}`, s.name, s.args))
+    .filter((tc) => tc.name);
 
   try {
     // eslint-disable-next-line no-constant-condition
@@ -152,10 +199,20 @@ async function parseSSE(res, onToken) {
           if (payload === '[DONE]') continue;
           try {
             const json = JSON.parse(payload);
-            const delta = json?.choices?.[0]?.delta?.content;
-            if (delta) {
-              full += delta;
-              if (onToken) onToken(delta);
+            const delta = json?.choices?.[0]?.delta;
+            if (delta?.content) {
+              full += delta.content;
+              if (onToken) onToken(delta.content);
+            }
+            if (Array.isArray(delta?.tool_calls)) {
+              for (const tc of delta.tool_calls) {
+                const idx = tc.index ?? 0;
+                const slot = toolAcc.get(idx) || { index: idx, id: '', name: '', args: '' };
+                if (tc.id) slot.id = tc.id;
+                if (tc.function?.name) slot.name = tc.function.name;
+                if (tc.function?.arguments) slot.args += tc.function.arguments;
+                toolAcc.set(idx, slot);
+              }
             }
             if (json?.usage) usage = json.usage;
           } catch {
@@ -167,12 +224,12 @@ async function parseSSE(res, onToken) {
   } catch (e) {
     if (e.name === 'AbortError') {
       // Caller treats a partial result as success — return what we have.
-      return { content: full, usage, aborted: true };
+      return { content: full, toolCalls: finalize(), usage, aborted: true };
     }
     throw apiError(`Stream error: ${e.message}`, 'network');
   }
 
-  return { content: full, usage };
+  return { content: full, toolCalls: finalize(), usage };
 }
 
 /** List available models (used by Settings to validate/refresh). */
@@ -236,6 +293,7 @@ function clampNum(value, min, max, fallback) {
 
 module.exports = {
   DEFAULT_ENDPOINT,
+  DEFAULT_MODEL,
   SUPPORTED_MODELS,
   sendMessage,
   listModels,

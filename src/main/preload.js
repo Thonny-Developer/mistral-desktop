@@ -31,14 +31,16 @@ contextBridge.exposeInMainWorld('api', {
   workspace: {
     get: () => ipcRenderer.invoke('workspace:get'),
     pick: () => ipcRenderer.invoke('workspace:pick'),
-    clear: () => ipcRenderer.invoke('workspace:clear')
+    clear: () => ipcRenderer.invoke('workspace:clear'),
+    set: (dir) => ipcRenderer.invoke('workspace:set', dir)
   },
 
   /* ---- agent todo list ---- */
   todos: {
     get: () => ipcRenderer.invoke('todos:get'),
     toggle: (id) => ipcRenderer.invoke('todos:toggle', id),
-    clear: () => ipcRenderer.invoke('todos:clear')
+    clear: () => ipcRenderer.invoke('todos:clear'),
+    set: (todos) => ipcRenderer.invoke('todos:set', todos)
   },
 
   /* ---- secure API key ---- */
@@ -54,6 +56,8 @@ contextBridge.exposeInMainWorld('api', {
     // Fire a streaming request; deltas/done/error arrive via onStream().
     send: (payload) => ipcRenderer.send('mistral:send', payload),
     abort: () => ipcRenderer.send('mistral:abort'),
+    // Answer a pending plan/tool/bash approval request from the agent loop.
+    respond: (approved) => ipcRenderer.send('agent:respond', approved),
     test: () => ipcRenderer.invoke('mistral:test'),
     models: () => ipcRenderer.invoke('mistral:models'),
     // Returns an unsubscribe fn so pages can clean up listeners.
@@ -62,6 +66,11 @@ contextBridge.exposeInMainWorld('api', {
       ipcRenderer.on('mistral:stream', handler);
       return () => ipcRenderer.removeListener('mistral:stream', handler);
     }
+  },
+
+  /* ---- context-window usage ---- */
+  context: {
+    stats: () => ipcRenderer.invoke('context:stats')
   },
 
   /* ---- window controls (custom titlebar) ---- */

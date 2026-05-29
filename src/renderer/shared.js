@@ -25,6 +25,7 @@ export const DEFAULT_SETTINGS = {
   fontSize: 14,
   collapseSidebar: false,
   reasoningLevel: 'medium',
+  aiPermissionMode: 'default',
   activePresetId: 'general'
 };
 

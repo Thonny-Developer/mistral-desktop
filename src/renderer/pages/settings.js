@@ -1,7 +1,7 @@
 /* Settings page — two-pane (section list + form pane).
  * Everything persists to electron-store and applies immediately. */
 import { getSettings, saveSettings, toast, escapeHtml } from '../shared.js';
-import { SUPPORTED_MODELS } from '../models.js';
+import { SUPPORTED_MODELS, MODEL_GROUPS, MODEL_INFO } from '../models.js';
 
 const api = window.api;
 
@@ -148,6 +148,18 @@ async function drawApi(pane, settings) {
 }
 
 /* ---------------- Model section ---------------- */
+/** Build grouped <optgroup> markup; any model missing from a group is appended. */
+function modelOptions(current) {
+  const grouped = new Set(MODEL_GROUPS.flatMap(([, ids]) => ids));
+  const opt = (m) => `<option value="${m}" ${m === current ? 'selected' : ''}>${m}</option>`;
+  let html = MODEL_GROUPS
+    .map(([label, ids]) => `<optgroup label="${label}">${ids.filter((m) => SUPPORTED_MODELS.includes(m)).map(opt).join('')}</optgroup>`)
+    .join('');
+  const ungrouped = SUPPORTED_MODELS.filter((m) => !grouped.has(m));
+  if (ungrouped.length) html += `<optgroup label="Other">${ungrouped.map(opt).join('')}</optgroup>`;
+  return html;
+}
+
 async function drawModel(pane, settings) {
   pane.innerHTML = `
     <div class="set-section">
@@ -155,11 +167,10 @@ async function drawModel(pane, settings) {
       <div class="set-sub">Sampling &amp; limits</div>
 
       <div class="setrow">
-        <div class="setlbl"><div class="l1">Model</div></div>
+        <div class="setlbl"><div class="l1">Model</div><div class="l2" id="modelCtx">${escapeHtml((MODEL_INFO[settings.model] || {}).context || '')}</div></div>
         <div class="setctl" style="max-width:300px">
           <select class="field-box" id="model" style="width:100%">
-            ${SUPPORTED_MODELS.map((m) =>
-              `<option value="${m}" ${m === settings.model ? 'selected' : ''}>${m}</option>`).join('')}
+            ${modelOptions(settings.model)}
           </select>
         </div>
       </div>
@@ -193,23 +204,28 @@ async function drawModel(pane, settings) {
     </div>`;
 
   pane.querySelector('#model').addEventListener('change', async (e) => {
+    settings.model = e.target.value; // keep the in-memory copy in sync so the
+    const ctx = pane.querySelector('#modelCtx'); // dropdown reflects the choice
+    if (ctx) ctx.textContent = (MODEL_INFO[e.target.value] || {}).context || ''; // on re-render
     await saveSettings({ model: e.target.value });
-    toast('Model updated', 'success', 1600);
+    toast(`Model set to ${e.target.value}`, 'success', 1600);
   });
   bindSeg(pane.querySelector('#reasoningLevel'), async (v) => {
+    settings.reasoningLevel = v;
     await saveSettings({ reasoningLevel: v });
     toast('Reasoning quality updated', 'success', 1600);
   });
   pane.querySelector('#maxTokens').addEventListener('change', async (e) => {
     const n = Math.max(0, parseInt(e.target.value, 10) || 0);
     e.target.value = n;
+    settings.maxTokens = n;
     await saveSettings({ maxTokens: n });
   });
 
   mountSlider(pane.querySelector('#tempRow .setctl'), settings.temperature, 0, 1.5, 0.01,
-    (v) => saveSettings({ temperature: v }), (v) => v.toFixed(2));
+    (v) => { settings.temperature = v; return saveSettings({ temperature: v }); }, (v) => v.toFixed(2));
   mountSlider(pane.querySelector('#toppRow .setctl'), settings.topP, 0, 1, 0.01,
-    (v) => saveSettings({ topP: v }), (v) => v.toFixed(2));
+    (v) => { settings.topP = v; return saveSettings({ topP: v }); }, (v) => v.toFixed(2));
 }
 
 /* ---------------- Output section ---------------- */
