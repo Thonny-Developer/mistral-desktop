@@ -103,3 +103,6 @@ npm run build:vendor
 `electron-builder.config.js` is stubbed for a generic provider. Wire up a real
 feed URL and call `autoUpdater.checkForUpdatesAndNotify()` in `main.js` to
 enable updates.
+
+npm run dist:win
+npm run dist:linux

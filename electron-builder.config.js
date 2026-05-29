@@ -24,6 +24,21 @@ module.exports = {
     // so packaging still works out of the box.
     artifactName: "${productName}-${version}-${arch}.${ext}"
   },
+  linux: {
+    target: [
+      { target: "AppImage", arch: ["x64"] },
+      { target: "pacman", arch: ["x64"] },
+      { target: "deb", arch: ["x64"] }
+    ],
+    // Author shown in deb/pacman package metadata (Maintainer field).
+    maintainer: "thonny_dev <thonnydev@gmail.com>",
+    // Project page linked from the package metadata (Homepage field).
+    homepage: "https://github.com/Thonny-Developer/mist-desktop",
+    // Drop a 512x512 `build/icon.png` to brand the app; falls back to the
+    // default Electron icon otherwise.
+    category: "Utility",
+    artifactName: "${productName}-${version}-${arch}.${ext}"
+  },
   nsis: {
     oneClick: false,
     perMachine: false,

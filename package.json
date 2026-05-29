@@ -3,7 +3,15 @@
   "productName": "Mistral CLI",
   "version": "1.4.0",
   "description": "A dark, terminal-native desktop client for the Mistral AI API.",
-  "author": "Mistral CLI",
+  "author": {
+    "name": "thonny_dev",
+    "email": "thonnydev@gmail.com"
+  },
+  "homepage": "https://github.com/Thonny-Developer/mist-desktop",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Thonny-Developer/mist-desktop.git"
+  },
   "license": "MIT",
   "main": "src/main/main.js",
   "scripts": {
@@ -13,7 +21,8 @@
     "dev": "electron . --dev",
     "pack": "electron-builder --dir --config electron-builder.config.js",
     "dist": "electron-builder --config electron-builder.config.js",
-    "dist:win": "electron-builder --win --config electron-builder.config.js"
+    "dist:win": "electron-builder --win --config electron-builder.config.js",
+    "dist:linux": "electron-builder --linux --config electron-builder.config.js"
   },
   "dependencies": {
     "electron-store": "^8.2.0",
