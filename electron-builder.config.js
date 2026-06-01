@@ -15,6 +15,7 @@ module.exports = {
     buildResources: "build"
   },
   win: {
+    icon: "build/icon.ico",
     target: [
       { target: "nsis", arch: ["x64"] },
       { target: "portable", arch: ["x64"] }
@@ -22,13 +23,14 @@ module.exports = {
     artifactName: "${productName}-${version}-${arch}.${ext}"
   },
   linux: {
+    icon: "build/icon.png",
     target: [
       { target: "AppImage", arch: ["x64"] },
       { target: "pacman", arch: ["x64"] },
       { target: "deb", arch: ["x64"] }
     ],
     maintainer: "thonny_dev <thonnydev@gmail.com>",
-    homepage: "https://github.com/Thonny-Developer/mist-desktop",
+    // homepage: "https://github.com/Thonny-Developer/mist-desktop",
     category: "Utility",
     artifactName: "${productName}-${version}-${arch}.${ext}"
   },
