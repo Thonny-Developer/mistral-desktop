@@ -53,7 +53,14 @@ src/
 │   ├── main.js      Electron main: frameless window, window-state persistence,
 │   │                electron-store IPC, safeStorage API key, export dialog
 │   ├── preload.js   Context bridge — the only IPC surface (contextIsolation)
-│   └── mistral.js   Mistral API service: native fetch, SSE streaming, abort
+│   ├── mistral.js   Mistral API service: native fetch, SSE streaming, abort
+│   ├── agent.js     Agentic loop: tool-calling turns, permission gates,
+│   │                planning/approval, and isolated subagents
+│   ├── tools.js     Tool registry — every tool's schema, permission metadata
+│   │                and implementation in one table (drives gating + discovery)
+│   ├── consoles.js  Persistent shell sessions (state carries across commands)
+│   ├── skills.js    Skill system: discover/parse/render Markdown playbooks
+│   └── skills/      Bundled skills (debug · review · simplify · analyze · …)
 └── renderer/
     ├── index.html   App shell (custom titlebar + nav rail + content)
     ├── app.js       Router / page manager, shortcuts, command palette
@@ -67,6 +74,44 @@ src/
 Security: `contextIsolation: true`, `nodeIntegration: false`, a strict CSP, and
 all Node/API access funnelled through namespaced IPC channels
 (`store:*`, `apikey:*`, `mistral:*`, `window:*`, `session:*`).
+
+## Extensibility
+
+Three subsystems make the agent extensible without touching the core loop:
+
+- **Tool registry** (`tools.js`) — each tool is declared once in a single table
+  with its schema *and* permission metadata (`readOnly` / `mutating` /
+  `destructive` / `shell` / `web` / `concurrencySafe` / `defer`). The
+  function-calling schemas sent to the model, the permission gates the loop
+  applies, the tool-discovery list, and the read-only subset a subagent may use
+  are all derived from it — so a tool can never drift between "registered",
+  "described" and "gated".
+
+- **Skills** (`skills.js` + `skills/*.md`) — reusable Markdown playbooks with
+  YAML-ish frontmatter (`name`, `description`, `allowed-tools`,
+  `argument-hint`). Discovered from three layers (bundled → `<userData>/skills`
+  → `<workingDir>/.mist/skills`, later overrides earlier). Invoke them as a
+  slash command in chat (`/review src`) or let the model pick one via the
+  `run_skill` / `list_skills` tools. `$ARGUMENTS` and `$1…$9` are substituted
+  into the body; a skill can restrict the turn to its `allowed-tools`. Manage
+  them in **Settings → Skills**.
+
+  ```markdown
+  ---
+  name: review
+  description: Review recent changes for bugs and improvements
+  allowed-tools: read_file, list_files, exec_bash
+  argument-hint: [path or focus]
+  ---
+  You are a senior reviewer. Review $ARGUMENTS …
+  ```
+
+- **Subagents** (`run_subagent` tool) — delegate a focused subtask to an
+  isolated worker with its own context and a restricted, mostly read-only
+  toolset. It runs autonomously (no user prompts), is depth-limited, stays
+  read-only in Default permission mode, and returns a single text report that
+  becomes the tool result for the parent. Subagent activity renders inline in
+  the chat as indented tool lines.
 
 ## Getting started
 

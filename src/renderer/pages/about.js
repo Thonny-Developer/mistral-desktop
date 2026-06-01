@@ -11,7 +11,6 @@ const SHORTCUTS = [
   ['New chat', 'Ctrl+N'],
   ['Command palette', 'Ctrl+K'],
   ['History', 'Ctrl+H'],
-  ['System prompt', 'Ctrl+P'],
   ['Settings', 'Ctrl+,'],
   ['Focus input', 'Ctrl+/'],
   ['Send', 'Enter'],

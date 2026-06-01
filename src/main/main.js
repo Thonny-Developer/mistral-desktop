@@ -7,6 +7,7 @@ const Store = require('electron-store');
 const mistral = require('./mistral');
 const agent = require('./agent');
 const tools = require('./tools');
+const skills = require('./skills');
 const { createConsoleManager } = require('./consoles');
 
 const isDev = process.argv.includes('--dev');
@@ -121,6 +122,33 @@ function appendMemory(items) {
   writeMemory(`${current}\n${lines}\n`);
 }
 
+function projectFilePath() {
+  const root = store.get('workingDir');
+  return path.join(root || app.getPath('userData'), 'MISTRAL.md');
+}
+
+function readProjectFile() {
+  const file = projectFilePath();
+  return fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '';
+}
+
+function initProjectFile() {
+  const file = projectFilePath();
+  if (fs.existsSync(file)) return { ok: false, path: file };
+  const content = `# MISTRAL Project Notes\n\n` +
+    `This file contains the project essence and ongoing development notes for the current workspace.\n\n` +
+    `Use it to capture the project goal, architecture, and key implementation details.\n`;
+  fs.writeFileSync(file, content, 'utf-8');
+  return { ok: true, path: file };
+}
+
+function appendProjectFile(notes) {
+  const file = projectFilePath();
+  if (!fs.existsSync(file)) fs.writeFileSync(file, '# MISTRAL Project Notes\n\n', 'utf-8');
+  fs.appendFileSync(file, `\n\n${notes.trim()}\n`, 'utf-8');
+  return file;
+}
+
 /* ------------------------------------------------------------------ *
  *  Agent system prompt
  * ------------------------------------------------------------------ */
@@ -147,6 +175,8 @@ const AGENT_INSTRUCTIONS = [
   '- web_fetch — open a URL and read its text content (use it after web_search, or directly when you know the URL).',
   '- add_todo / complete_todo / list_todos — manage the plan.',
   '- remember — save a durable fact about the user or project.',
+  '- list_skills / run_skill — discover and follow reusable skill playbooks. When a request matches a skill, prefer run_skill over improvising.',
+  '- run_subagent — delegate a focused, self-contained subtask (e.g. "analyse module X and report") to an isolated subagent with its own context. Use it to keep your own context lean or to parallelise research; it runs autonomously and returns a text report.',
   '',
   'Guidelines:',
   '- All paths are relative to the working folder; you cannot read or write outside it.',
@@ -184,7 +214,7 @@ const PERMISSION_MODE_HINTS = {
 
 /** Build the full agent system message including live state. */
 function buildAgentSystem(settings) {
-  const reasoningLevel = (settings && settingsMistral-Desktop.reasoningLevel) || 'medium';
+  const reasoningLevel = (settings && settings.reasoningLevel) || 'medium';
   const reasoningHint = REASONING_HINTS[reasoningLevel] || REASONING_HINTS.medium;
   const permMode = (settings && settings.aiPermissionMode) || 'default';
   const permHint = PERMISSION_MODE_HINTS[permMode] || PERMISSION_MODE_HINTS.default;
@@ -193,6 +223,11 @@ function buildAgentSystem(settings) {
   const todos = store.get('todos') || [];
   const todoStr = todos.length
     ? todos.map((t) => `[${t.done ? 'x' : ' '}] (${t.id}) ${t.text}`).join('\n')
+    : '(none)';
+  const projectNotes = readProjectFile().trim();
+  const skillList = skills.listSkills(work);
+  const skillStr = skillList.length
+    ? skillList.map((s) => `- ${s.name}${s.argumentHint ? ` ${s.argumentHint}` : ''} — ${s.description || ''}`.trimEnd()).join('\n')
     : '(none)';
   return [
     AGENT_INSTRUCTIONS,
@@ -204,12 +239,16 @@ function buildAgentSystem(settings) {
     '',
     `Working folder: ${work || '(none — ask to set one with set_working_folder)'}`,
     '',
+    'Available skills (invoke with run_skill):',
+    skillStr,
+    '',
     'Open todos:',
     todoStr,
     '',
     'Current long-term memory:',
-    mem || '(empty)'
-  ].join('\n');
+    mem || '(empty)',
+    projectNotes ? ['', 'Project notes from MISTRAL.md:', projectNotes] : []
+  ].flat().join('\n');
 }
 
 /* ------------------------------------------------------------------ *
@@ -361,6 +400,28 @@ ipcMain.handle('workspace:set', (_e, dir) => {
   return store.get('workingDir') || '';
 });
 
+// Skills (Markdown playbooks). Discovery is re-read on every call so edits in
+// the user/project folders show up without a restart.
+ipcMain.handle('skills:list', () => skills.listSkills(store.get('workingDir') || ''));
+ipcMain.handle('skills:render', (_e, name, args) =>
+  skills.renderSkill(name, args || '', store.get('workingDir') || ''));
+ipcMain.handle('skills:save', (_e, skill) => skills.saveSkill(skill || {}));
+ipcMain.handle('skills:delete', (_e, name) => skills.deleteSkill(name));
+ipcMain.handle('skills:dir', () => skills.ensureUserDir());
+ipcMain.handle('skills:openDir', async () => {
+  const dir = skills.ensureUserDir();
+  await shell.openPath(dir);
+  return dir;
+});
+
+ipcMain.handle('project:read', () => readProjectFile());
+ipcMain.handle('project:init', () => initProjectFile());
+ipcMain.handle('project:exists', () => fs.existsSync(projectFilePath()));
+ipcMain.handle('project:append', (_e, notes) => {
+  appendProjectFile(notes);
+  return { ok: true };
+});
+
 // Todos (shared between the agent and the UI).
 ipcMain.handle('todos:get', () => store.get('todos') || []);
 ipcMain.handle('todos:toggle', (_e, id) => {
@@ -402,7 +463,7 @@ ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false);
  *  IPC: Mistral API
  *  Streaming uses fire-and-forget `send` + push events on 'mistral:stream'.
  * ------------------------------------------------------------------ */
-ipcMain.on('mistral:send', async (event, { messages }) => {
+ipcMain.on('mistral:send', async (event, { messages, allowedTools }) => {
   const settings = store.get('settings');
   const apiKey = getApiKey();
 
@@ -429,7 +490,14 @@ ipcMain.on('mistral:send', async (event, { messages }) => {
   // Persistent shell sessions scoped to this request — closed when it finishes
   // so no shells leak between messages.
   const consoles = createConsoleManager();
-  const ctx = { store, getWindow: () => mainWindow, appendMemory, signal: controller.signal, consoles };
+  // ctx carries everything the tool layer (incl. the subagent tool) needs:
+  // the store, the active window, memory append, the abort signal, the
+  // console manager, and — for spawning subagents — the resolved settings,
+  // API key, event sink and the current subagent depth (0 at the top level).
+  const ctx = {
+    store, getWindow: () => mainWindow, appendMemory, signal: controller.signal, consoles,
+    settings, apiKey, emit: reply, subagentDepth: 0
+  };
 
   try {
     await agent.run({
@@ -439,7 +507,8 @@ ipcMain.on('mistral:send', async (event, { messages }) => {
       signal: controller.signal,
       emit: reply,
       requestApproval,
-      ctx
+      ctx,
+      allowedTools
     });
   } catch (err) {
     reply({ type: 'error', message: err.message, code: err.code || 'unknown' });
@@ -503,6 +572,29 @@ ipcMain.handle('session:export', async (_e, { session, format }) => {
   return { ok: true, filePath };
 });
 
+function formatSessionContent(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (typeof part === 'string') return part;
+      if (part.type === 'text') return part.text || '';
+      if (part.type === 'image_url') {
+        const imageRef = part.image_url || part.imageUrl;
+        if (typeof imageRef === 'string') {
+          return imageRef.startsWith('data:') ? '![attached image]' : `![image](${imageRef})`;
+        }
+        return '![attached image]';
+      }
+      return typeof part.text === 'string' ? part.text : '';
+    }).filter(Boolean).join(' ');
+  }
+  if (typeof content === 'object') {
+    return formatSessionContent(content.content || content.text);
+  }
+  return String(content);
+}
+
 function sessionToMarkdown(session) {
   const lines = [];
   lines.push(`# ${session.title || 'Untitled session'}`, '');
@@ -511,7 +603,7 @@ function sessionToMarkdown(session) {
   lines.push(`- **Messages:** ${session.messageCount ?? session.messages?.length ?? 0}`, '', '---', '');
   for (const m of session.messages || []) {
     const who = m.role === 'user' ? '## You' : m.role === 'assistant' ? '## Mistral' : `## ${m.role}`;
-    lines.push(who, '', m.content || '', '');
+    lines.push(who, '', formatSessionContent(m.content), '');
   }
   return lines.join('\n');
 }

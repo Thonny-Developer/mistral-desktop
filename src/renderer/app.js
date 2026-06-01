@@ -5,7 +5,6 @@ import { getSettings, saveSettings, navSvg, toast, store, formatRelative, escape
 import chatPage from './pages/chat.js';
 import settingsPage from './pages/settings.js';
 import historyPage from './pages/history.js';
-import systemPromptPage from './pages/system-prompt.js';
 import aboutPage from './pages/about.js';
 
 const api = window.api;
@@ -40,7 +39,6 @@ const PAGES = {
   chat: { mod: chatPage, labelKey: 'Chat' },
   settings: { mod: settingsPage, labelKey: 'Settings' },
   history: { mod: historyPage, labelKey: 'History' },
-  prompt: { mod: systemPromptPage, labelKey: 'System Prompt' },
   about: { mod: aboutPage, labelKey: 'About' }
 };
 
@@ -100,7 +98,6 @@ function setActiveNav(name) {
 const MENU_ITEMS = [
   ['settings', 'Settings'],
   ['history', 'History'],
-  ['prompt', 'System Prompt'],
   ['about', 'About']
 ];
 
@@ -265,7 +262,6 @@ function paletteCommands() {
   return [
     { label: `＋ ${t('New chat', locale)}`, key: 'Ctrl+N', run: () => startNewChat() },
     { label: `⎘ ${t('Open', locale)} ${t('History', locale)}`, key: 'Ctrl+H', run: () => navigate('history') },
-    { label: `✎ ${t('Edit system prompt', locale)}`, key: 'Ctrl+P', run: () => navigate('prompt') },
     { label: `⚙ ${t('Settings', locale)}`, key: 'Ctrl+,', run: () => navigate('settings') },
     { label: `ⓘ ${t('About', locale)}`, key: '', run: () => navigate('about') }
   ];
@@ -342,7 +338,6 @@ function wireShortcuts() {
     switch (e.key.toLowerCase()) {
       case 'n': e.preventDefault(); startNewChat(); break;
       case 'h': e.preventDefault(); navigate('history'); break;
-      case 'p': e.preventDefault(); navigate('prompt'); break;
       case ',': e.preventDefault(); navigate('settings'); break;
       case '/':
         // Ctrl+/ — focus chat input (navigate to chat if needed)

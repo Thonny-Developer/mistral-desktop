@@ -32,6 +32,29 @@ const SUPPORTED_MODELS = [
 /** Fallback model when settings don't specify one. */
 const DEFAULT_MODEL = 'codestral-latest';
 
+/**
+ * Normalise a message/delta `content` into plain text.
+ *
+ * Older Mistral models stream `content` as a plain string, but newer ones
+ * (and the reasoning "magistral" family) return it as structured content
+ * chunks — an array of, or a single, object like `{type:'text', text:'…'}` or
+ * `{type:'thinking', thinking:[…]}`. Appending those objects directly is what
+ * produced the "[object Object][object Object]…" output, so we flatten any
+ * shape down to text here, at the single point where content enters the app.
+ */
+function contentToText(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map(contentToText).join('');
+  if (typeof content === 'object') {
+    if (typeof content.text === 'string') return content.text;
+    if (typeof content.content !== 'undefined') return contentToText(content.content);
+    if (typeof content.thinking !== 'undefined') return contentToText(content.thinking);
+    return '';
+  }
+  return String(content);
+}
+
 /** Build a tagged error so the renderer can branch on `.code`. */
 function apiError(message, code) {
   const err = new Error(message);
@@ -64,6 +87,22 @@ function errorForStatus(status, bodyText) {
     return apiError(detail || `Mistral server error (${status}).`, 'server');
   }
   return apiError(detail || `Request failed (${status}).`, 'http');
+}
+
+/** Extract rate limit information from response headers. */
+function extractRateLimitInfo(headers) {
+  if (!headers) return null;
+  const limit = parseInt(headers.get('x-ratelimit-limit'), 10);
+  const remaining = parseInt(headers.get('x-ratelimit-remaining'), 10);
+  const reset = parseInt(headers.get('x-ratelimit-reset'), 10);
+  if (!Number.isFinite(limit) && !Number.isFinite(remaining) && !Number.isFinite(reset)) {
+    return null;
+  }
+  return {
+    limit: Number.isFinite(limit) ? limit : null,
+    remaining: Number.isFinite(remaining) ? remaining : null,
+    resetAt: Number.isFinite(reset) ? reset * 1000 : null // convert to milliseconds
+  };
 }
 
 /**
@@ -144,10 +183,11 @@ async function sendMessage({ messages, settings, apiKey, onToken, signal, tools 
   if (!stream) {
     const data = await res.json();
     const msg = data?.choices?.[0]?.message || {};
-    const content = msg.content || '';
+    const content = contentToText(msg.content);
     if (onToken && content) onToken(content);
     const toolCalls = (msg.tool_calls || []).map((tc, i) => parseToolCall(tc.id || `call_${i}`, tc.function?.name, tc.function?.arguments));
-    return { content, toolCalls, usage: data?.usage || null };
+    const rateLimit = extractRateLimitInfo(res.headers);
+    return { content, toolCalls, usage: data?.usage || null, rateLimit };
   }
 
   // Streaming path: parse SSE frames as they arrive.
@@ -200,9 +240,10 @@ async function parseSSE(res, onToken) {
           try {
             const json = JSON.parse(payload);
             const delta = json?.choices?.[0]?.delta;
-            if (delta?.content) {
-              full += delta.content;
-              if (onToken) onToken(delta.content);
+            const piece = contentToText(delta?.content);
+            if (piece) {
+              full += piece;
+              if (onToken) onToken(piece);
             }
             if (Array.isArray(delta?.tool_calls)) {
               for (const tc of delta.tool_calls) {
@@ -224,12 +265,14 @@ async function parseSSE(res, onToken) {
   } catch (e) {
     if (e.name === 'AbortError') {
       // Caller treats a partial result as success — return what we have.
-      return { content: full, toolCalls: finalize(), usage, aborted: true };
+      const rateLimit = extractRateLimitInfo(res.headers);
+      return { content: full, toolCalls: finalize(), usage, aborted: true, rateLimit };
     }
     throw apiError(`Stream error: ${e.message}`, 'network');
   }
 
-  return { content: full, toolCalls: finalize(), usage };
+  const rateLimit = extractRateLimitInfo(res.headers);
+  return { content: full, toolCalls: finalize(), usage, rateLimit };
 }
 
 /** List available models (used by Settings to validate/refresh). */

@@ -18,14 +18,10 @@ const tools = require('./tools');
 
 const MAX_TURNS = 16; // hard cap so a misbehaving model can't loop forever
 
-/** Tools that run shell commands — confirmed in `default` and `tools-bypass`. */
-const SHELL_TOOLS = new Set(['exec_bash', 'console_exec']);
-/** Tools that change files or the system (need a plan in `default` mode). */
-const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'delete_file', 'exec_bash', 'console_exec']);
-/** Tools that need explicit approval in `default` mode. */
-const IMPORTANT_TOOLS = new Set(['write_file', 'edit_file', 'delete_file', 'exec_bash', 'console_exec']);
-/** Tools that reach the internet — confirmed per-site in `default` mode. */
-const WEB_TOOLS = new Set(['web_search', 'web_fetch']);
+// Permission metadata now lives with the tools themselves (single source of
+// truth). The agent loop only asks the registry which confirmation a call
+// needs and which tools count as "mutating" for the planning gate.
+const { confirmKindFor, MUTATING_TOOLS } = tools;
 
 /** Strip any stray agent directives a model might still emit as text. */
 function stripTags(text) {
@@ -34,14 +30,6 @@ function stripTags(text) {
     .replace(/<action>[\s\S]*$/i, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
-}
-
-/** Which confirmation a tool needs in the given mode (or null). */
-function confirmKindFor(tool, mode) {
-  if (SHELL_TOOLS.has(tool) && (mode === 'default' || mode === 'tools-bypass')) return 'bash';
-  if (mode === 'default' && WEB_TOOLS.has(tool)) return 'web';
-  if (mode === 'default' && IMPORTANT_TOOLS.has(tool)) return 'tool';
-  return null;
 }
 
 /**
@@ -72,10 +60,18 @@ function pruneForSend(work) {
  * @param {Function} o.requestApproval (payload) => Promise<boolean>.
  * @param {Object}   o.ctx             Tool context ({ store, getWindow, appendMemory, signal }).
  */
-async function run({ baseMessages, settings, apiKey, signal, emit, requestApproval, ctx }) {
+async function run({ baseMessages, settings, apiKey, signal, emit, requestApproval, ctx, allowedTools }) {
   const work = [...baseMessages];
   const mode = settings.aiPermissionMode || 'default';
   const ask = requestApproval || (async () => true);
+  // A skill can restrict the turn to a subset of tools; otherwise the full set.
+  // The todo tools are always kept available so the Default-mode planning gate
+  // (which asks the model to add_todo before mutating) can never deadlock a
+  // restricted skill that uses, say, edit_file but didn't list add_todo.
+  const CONTROL_TOOLS = ['add_todo', 'complete_todo', 'list_todos'];
+  const toolSchemas = (Array.isArray(allowedTools) && allowedTools.length)
+    ? tools.buildSchemas(new Set([...allowedTools, ...CONTROL_TOOLS]))
+    : tools.TOOL_SCHEMAS;
 
   /**
    * Execute one tool call, applying the mode's confirmation gates. Always
@@ -129,6 +125,9 @@ async function run({ baseMessages, settings, apiKey, signal, emit, requestApprov
       ok: r.ok,
       summary: r.summary,
       error: r.error,
+      // How much text this result fed back into the context (file reads, command
+      // output, etc.) — so the UI's context gauge can account for it.
+      outputChars: (r.output == null ? '' : String(r.output)).length,
       todosChanged: !!r.todosChanged,
       workspaceChanged: !!r.workspaceChanged
     });
@@ -155,7 +154,7 @@ async function run({ baseMessages, settings, apiKey, signal, emit, requestApprov
         settings,
         apiKey,
         signal,
-        tools: tools.TOOL_SCHEMAS,
+        tools: toolSchemas,
         onToken: (delta) => { text += delta; emit({ type: 'token', delta }); }
       });
     } catch (e) {
@@ -166,6 +165,13 @@ async function run({ baseMessages, settings, apiKey, signal, emit, requestApprov
 
     text = result.content ?? text;
     const calls = result.toolCalls || [];
+
+    // Report the real token usage for this request. The latest prompt_tokens is
+    // the true size of the context window (it already includes the system
+    // prompt, tool schemas, every message AND every tool result like file reads
+    // and reasoning), so the UI can show an accurate gauge instead of an estimate.
+    if (result.usage) emit({ type: 'usage', usage: result.usage });
+    if (result.rateLimit) emit({ type: 'rate-limit', rateLimit: result.rateLimit });
 
     if (result.aborted) {
       emit({ type: 'done', content: stripTags(text), aborted: true, usage: result.usage });
@@ -236,4 +242,102 @@ async function run({ baseMessages, settings, apiKey, signal, emit, requestApprov
   emit({ type: 'done', content: '_Достигнут предел шагов для одного запроса. Напишите «продолжай», чтобы я довёл задачу до конца._' });
 }
 
-module.exports = { run, stripTags };
+/* ==================================================================== *
+ *  Subagents
+ *
+ *  A subagent is an isolated worker the main loop spawns (via the
+ *  run_subagent tool) to carry out one focused task. It has its OWN
+ *  conversation/context (separate from the parent transcript) but shares
+ *  the workspace, runs autonomously with no user approval, and is limited
+ *  to a restricted, mostly read-only toolset. Its single output is a final
+ *  text report, which becomes the tool result fed back to the parent.
+ * ------------------------------------------------------------------------ */
+const SUBAGENT_MAX_TURNS = 8;
+const SUBAGENT_MAX_DEPTH = 2;
+
+/** Focused system prompt for a subagent run. */
+function buildSubagentSystem(mode, allowed) {
+  return [
+    'You are a subagent — an isolated worker spawned by the main assistant to carry out ONE focused task and report back.',
+    'You run fully autonomously: there is no user to talk to. Never ask questions; make reasonable assumptions and proceed.',
+    `Tools available to you: ${[...allowed].join(', ')}. You cannot use any other tool.`,
+    mode === 'read'
+      ? 'You are READ-ONLY: explore, read and analyze, but do not modify anything.'
+      : 'You may read and edit files, but you cannot delete files or run shell commands.',
+    'All paths are relative to the shared working folder.',
+    'When finished, reply with a concise, self-contained report (plain text, no tool call). That report is your ONLY output to the main assistant — include every conclusion it needs.'
+  ].join('\n');
+}
+
+/**
+ * Run an isolated subagent loop.
+ * @returns {Promise<{text:string, aborted?:boolean}>}
+ */
+async function runSubagent({ task, focus, mode, settings, apiKey, signal, emit, ctx, depth }) {
+  const allowed = new Set(tools.READONLY_TOOLS);
+  if (mode === 'write') { allowed.add('write_file'); allowed.add('edit_file'); }
+  // The subagent may itself discover/follow skills, but never spawn more agents.
+  allowed.add('list_skills'); allowed.add('run_skill');
+
+  const schemas = tools.buildSchemas(allowed);
+  const work = [
+    { role: 'system', content: buildSubagentSystem(mode, allowed) },
+    { role: 'user', content: focus ? `Task: ${task}\n\nContext: ${focus}` : `Task: ${task}` }
+  ];
+  // Subagents share the workspace but get a fresh depth counter so they can't
+  // recurse without bound.
+  const subCtx = { ...ctx, subagentDepth: depth };
+
+  emit?.({ type: 'subagent-start', task, mode });
+  let finalText = '';
+
+  for (let turn = 0; turn < SUBAGENT_MAX_TURNS; turn++) {
+    let text = '';
+    let result;
+    try {
+      result = await mistral.sendMessage({
+        messages: work, settings, apiKey, signal, tools: schemas,
+        onToken: (d) => { text += d; } // accumulate only — never leak to the main stream
+      });
+    } catch (e) {
+      if (e.code === 'aborted') { emit?.({ type: 'subagent-done', aborted: true }); return { text: finalText, aborted: true }; }
+      emit?.({ type: 'subagent-done', error: e.message });
+      return { text: `Subagent error: ${e.message}` };
+    }
+
+    text = result.content ?? text;
+    const calls = result.toolCalls || [];
+    if (result.aborted) { emit?.({ type: 'subagent-done', aborted: true }); return { text: stripTags(text), aborted: true }; }
+
+    if (!calls.length) {
+      finalText = stripTags(text);
+      emit?.({ type: 'subagent-done', task });
+      return { text: finalText };
+    }
+
+    work.push({
+      role: 'assistant', content: text || '',
+      tool_calls: calls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.rawArguments } }))
+    });
+
+    for (const c of calls) {
+      if (signal?.aborted) { emit?.({ type: 'subagent-done', aborted: true }); return { text: finalText, aborted: true }; }
+      let output;
+      if (c.error) {
+        emit?.({ type: 'subagent-tool', name: c.name, ok: false, summary: `неверные аргументы: ${c.error}` });
+        output = `Error: invalid arguments — ${c.error}. Retry with valid JSON.`;
+      } else {
+        emit?.({ type: 'subagent-tool-start', name: c.name });
+        const r = await tools.exec({ tool: c.name, ...(c.args || {}) }, subCtx, allowed);
+        emit?.({ type: 'subagent-tool', name: c.name, ok: r.ok, summary: r.summary, workspaceChanged: !!r.workspaceChanged });
+        output = r.output;
+      }
+      work.push({ role: 'tool', tool_call_id: c.id, name: c.name, content: String(output ?? '') });
+    }
+  }
+
+  emit?.({ type: 'subagent-done', task, truncated: true });
+  return { text: finalText || '(субагент достиг предела шагов, не завершив задачу)' };
+}
+
+module.exports = { run, stripTags, runSubagent, SUBAGENT_MAX_DEPTH };

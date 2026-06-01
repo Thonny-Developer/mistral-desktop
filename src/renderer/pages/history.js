@@ -8,7 +8,8 @@ let query = '';
 const selected = new Set();
 
 async function render(container, ctx) {
-  const sessions = (await store.get('sessions')) || [];
+  let sessions = [];
+  let loaded = false;
 
   container.innerHTML = `
     <div class="history">
@@ -18,6 +19,7 @@ async function render(container, ctx) {
           <input type="text" id="histSearch" placeholder="Search sessions…" value="${escapeHtml(query)}" />
         </div>
         <span class="spacer"></span>
+        <button class="btn ghost sm danger" id="deleteAllBtn" title="Delete all chats">Delete all</button>
         <span class="hist-count" id="histCount"></span>
       </div>
 
@@ -41,11 +43,32 @@ async function render(container, ctx) {
 
   const rowsEl = container.querySelector('#histRows');
   const search = container.querySelector('#histSearch');
+  const deleteAllBtn = container.querySelector('#deleteAllBtn');
+
+  const renderLoading = () => {
+    container.querySelector('#histCount').textContent = 'Loading…';
+    deleteAllBtn.disabled = true;
+    rowsEl.innerHTML = `
+      <div class="hist-loading">
+        ${Array.from({ length: 6 }).map(() => `
+          <div class="hist-loading-row">
+            <div class="bars"><div class="bar w90 shimmer"></div></div>
+            <div class="bars"><div class="bar w60 shimmer"></div></div>
+          </div>
+        `).join('')}
+      </div>`;
+  };
 
   const draw = () => {
     const filtered = sessions.filter((s) => (s.title || '').toLowerCase().includes(query.toLowerCase()));
-    container.querySelector('#histCount').textContent = `${sessions.length} session${sessions.length === 1 ? '' : 's'}`;
+    const countLabel = loaded ? `${sessions.length} session${sessions.length === 1 ? '' : 's'}` : 'Loading…';
+    container.querySelector('#histCount').textContent = countLabel;
+    deleteAllBtn.disabled = !loaded || !sessions.length;
 
+    if (!loaded) {
+      renderLoading();
+      return;
+    }
     if (!sessions.length) {
       rowsEl.innerHTML = `<div class="empty"><div class="glyph"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 5v3l2 1"/></svg></div>
         <div class="title">No history yet</div><div class="sub">Conversations you have are saved here automatically.</div></div>`;
@@ -140,6 +163,21 @@ async function render(container, ctx) {
     toast('Sessions deleted', 'info', 2000);
     draw();
   });
+
+  deleteAllBtn.addEventListener('click', async () => {
+    if (!sessions.length) return;
+    const ok = await confirmDialog({
+      title: 'Delete all chats?',
+      body: `This will permanently remove all ${sessions.length} saved conversations.`,
+      confirmText: 'Delete all', danger: true
+    });
+    if (!ok) return;
+    sessions.length = 0;
+    selected.clear();
+    await store.set('sessions', sessions);
+    toast('All chats deleted', 'info', 2000);
+    draw();
+  });
   container.querySelector('#bulkExport').addEventListener('click', async () => {
     const fmt = await pickFormat();
     if (!fmt) return;
@@ -157,6 +195,10 @@ async function render(container, ctx) {
 
   draw();
   setTimeout(() => search.focus(), 60);
+
+  sessions = (await store.get('sessions')) || [];
+  loaded = true;
+  draw();
 }
 
 /* Ask md vs json via the confirm modal pattern (two-button choice). */

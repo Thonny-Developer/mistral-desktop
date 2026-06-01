@@ -18,6 +18,7 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const { exec: execCommand } = require('child_process');
+const skills = require('./skills');
 
 const MAX_READ_BYTES = 20_000; // keep file reads from blowing the context window
 const IGNORE = new Set(['node_modules', '.git', '.DS_Store']);
@@ -355,68 +356,353 @@ async function webFetch(a, ctx) {
   return { ok: true, summary: `Загрузил ${hostOf(url)} (${text.length} симв.)`, output: out || '(пустая страница)' };
 }
 
-/* ---------------- dispatcher ---------------- */
-async function exec(action, ctx) {
-  try {
-    switch (action.tool) {
-      case 'set_working_folder': return await pickFolder(ctx);
-      case 'list_files': return await listFiles(action, ctx);
-      case 'read_file': return await readFile(action, ctx);
-      case 'write_file': return await writeFile(action, ctx);
-      case 'edit_file': return await editFile(action, ctx);
-      case 'delete_file': return await deleteFile(action, ctx);
-      case 'add_todo': return addTodo(action, ctx);
-      case 'complete_todo': return completeTodo(action, ctx);
-      case 'list_todos': return listTodos(ctx);
-      case 'remember': return remember(action, ctx);
-      case 'exec_bash': return await execBash(action, ctx);
-      case 'console_open': return consoleOpen(action, ctx);
-      case 'console_exec': return await consoleExec(action, ctx);
-      case 'console_close': return consoleClose(action, ctx);
-      case 'console_list': return consoleList(ctx);
-      case 'web_search': return await webSearch(action, ctx);
-      case 'web_fetch': return await webFetch(action, ctx);
-      default:
-        return { ok: false, summary: `unknown tool: ${action.tool}`, output: `Error: unknown tool "${action.tool}".` };
+/* ---------------- skill tools ---------------- */
+// Skills are user-extensible Markdown playbooks. list_skills lets the model
+// discover them; run_skill returns the rendered playbook text for the model to
+// follow next (its actions still go through the normal tool gates).
+function listSkillsTool(_a, ctx) {
+  const work = ctx.store.get('workingDir') || '';
+  const items = skills.listSkills(work);
+  const out = items.length
+    ? items.map((s) => `/${s.name} — ${s.description || '(no description)'}${s.argumentHint ? ` · ${s.argumentHint}` : ''}`).join('\n')
+    : '(нет доступных скиллов)';
+  return { ok: true, summary: `Скиллов: ${items.length}`, output: out };
+}
+
+function createSkillTool(a) {
+  if (!a.name) throw new Error('create_skill requires "name".');
+  if (!a.body) throw new Error('create_skill requires "body".');
+  const r = skills.saveSkill({
+    name: a.name,
+    description: a.description || '',
+    allowedTools: a.allowed_tools || a.allowedTools || null,
+    argumentHint: a.argument_hint || a.argumentHint || '',
+    body: a.body
+  });
+  return {
+    ok: true,
+    summary: `Создан скилл /${r.name}`,
+    output: `OK: skill "/${r.name}" saved to ${r.path}. It is now available as a slash command and via run_skill.`
+  };
+}
+
+function runSkillTool(a, ctx) {
+  if (!a.name) throw new Error('run_skill requires "name".');
+  const work = ctx.store.get('workingDir') || '';
+  const r = skills.renderSkill(a.name, a.arguments || '', work);
+  if (!r) {
+    return { ok: false, summary: `Скилл не найден: ${a.name}`, output: `Error: skill "${a.name}" not found. Call list_skills to see available skills.` };
+  }
+  const note = r.allowedTools ? `\n\n(Skill's recommended tools: ${r.allowedTools.join(', ')}.)` : '';
+  return {
+    ok: true,
+    summary: `Скилл · ${r.name}`,
+    output: `Follow this skill playbook now, then continue the task:\n\n${r.prompt}${note}`
+  };
+}
+
+/* ---------------- subagent tool ---------------- */
+// Spawns an isolated worker with its own context and a restricted toolset.
+// Lazy-require of ./agent avoids the tools<->agent circular dependency.
+async function runSubagentTool(a, ctx) {
+  if (!a.task) throw new Error('run_subagent requires "task".');
+  const agent = require('./agent');
+  const depth = ctx.subagentDepth || 0;
+  if (depth >= agent.SUBAGENT_MAX_DEPTH) {
+    return { ok: false, summary: 'предел вложенности субагентов', output: 'Error: subagent nesting limit reached — do this work directly instead.' };
+  }
+  // In Default mode a subagent must stay read-only (its inner actions run
+  // without per-step confirmation, so we never let it mutate the workspace
+  // unless the user has chosen a more permissive mode).
+  const parentMode = (ctx.settings && ctx.settings.aiPermissionMode) || 'default';
+  const mode = (a.mode === 'write' && parentMode !== 'default') ? 'write' : 'read';
+
+  const r = await agent.runSubagent({
+    task: String(a.task),
+    focus: a.context ? String(a.context) : '',
+    mode,
+    settings: ctx.settings,
+    apiKey: ctx.apiKey,
+    signal: ctx.signal,
+    emit: ctx.emit,
+    ctx,
+    depth: depth + 1
+  });
+  if (r.aborted) return { ok: false, summary: 'субагент прерван', error: 'aborted', output: r.text || 'Прервано пользователем.' };
+  return { ok: true, summary: `Субагент завершил · ${String(a.task).slice(0, 40)}`, output: r.text || '(субагент не вернул отчёт)' };
+}
+
+/* ==================================================================== *
+ *  Tool registry
+ *
+ *  Each tool is described exactly once — its schema, its permission
+ *  metadata and its implementation. Everything else is derived from this
+ *  table: the function-calling schemas sent to the model, the permission
+ *  gates the agent loop applies, the tool-discovery list shown in the UI,
+ *  and the read-only subset a subagent is allowed to use.
+ *
+ *  This replaces the old hand-maintained switch + parallel schema array,
+ *  so a tool can never drift between "registered", "described" and
+ *  "gated" — they all come from one source.
+ * ------------------------------------------------------------------------ */
+const str = (description) => ({ type: 'string', description });
+const bool = (description) => ({ type: 'boolean', description });
+
+/**
+ * @typedef {Object} ToolDef
+ * @property {string}   name
+ * @property {string}   description       Sent to the model AND shown as `prompt()`.
+ * @property {Object}   [parameters]      JSON-schema `properties` map.
+ * @property {string[]} [required]
+ * @property {'fs'|'shell'|'web'|'todo'|'memory'|'agent'} group
+ * @property {boolean}  [readOnly]        No side effects → never needs confirmation.
+ * @property {boolean}  [mutating]        Changes files/system → planned + gated in default mode.
+ * @property {boolean}  [destructive]     Can irreversibly lose data.
+ * @property {boolean}  [shell]           Runs an arbitrary shell command.
+ * @property {boolean}  [web]             Reaches the network.
+ * @property {boolean}  [concurrencySafe] Safe to run in parallel (default true).
+ * @property {boolean}  [defer]           Excluded from the default schema set (lazy/loaded on demand).
+ * @property {(action, ctx) => any} run
+ */
+
+/** @type {ToolDef[]} */
+const DEFS = [
+  { name: 'set_working_folder', group: 'fs', concurrencySafe: false,
+    description: 'Open a dialog asking the user to pick the folder to work in. Call first if no working folder is set and you need files.',
+    run: (_a, ctx) => pickFolder(ctx) },
+
+  { name: 'list_files', group: 'fs', readOnly: true,
+    description: 'List files and directories at a path (relative to the working folder).',
+    parameters: { path: str('Relative path; defaults to the folder root.') },
+    run: listFiles },
+
+  { name: 'read_file', group: 'fs', readOnly: true,
+    description: 'Read a file. Always read a file before editing or overwriting it.',
+    parameters: { path: str('Relative path to the file.') }, required: ['path'],
+    run: readFile },
+
+  { name: 'write_file', group: 'fs', mutating: true, concurrencySafe: false,
+    description: 'Create a new file or fully overwrite an existing one. Provide the COMPLETE file content. Prefer edit_file for changing part of an existing file.',
+    parameters: { path: str('Relative path.'), content: str('Full file content.') }, required: ['path', 'content'],
+    run: writeFile },
+
+  { name: 'edit_file', group: 'fs', mutating: true, concurrencySafe: false,
+    description: 'Replace an exact snippet in an existing file. old_string must match the file exactly and be unique (add surrounding context to disambiguate), or set replace_all to replace every occurrence. Preferred way to change existing files.',
+    parameters: {
+      path: str('Relative path.'),
+      old_string: str('Exact text to find (verbatim, including whitespace).'),
+      new_string: str('Replacement text. Empty string deletes the snippet.'),
+      replace_all: bool('Replace every occurrence instead of requiring a unique match.')
+    }, required: ['path', 'old_string', 'new_string'],
+    run: editFile },
+
+  { name: 'delete_file', group: 'fs', mutating: true, destructive: true, concurrencySafe: false,
+    description: 'Delete a file or folder.',
+    parameters: { path: str('Relative path.') }, required: ['path'],
+    run: deleteFile },
+
+  { name: 'add_todo', group: 'todo',
+    description: 'Add a concrete, verifiable step to the plan.',
+    parameters: { text: str('What the step does.') }, required: ['text'],
+    run: addTodo },
+
+  { name: 'complete_todo', group: 'todo',
+    description: 'Mark a todo done.',
+    parameters: { id: str('Todo id from list_todos.'), text: str('Or match by text.') },
+    run: completeTodo },
+
+  { name: 'list_todos', group: 'todo', readOnly: true,
+    description: 'List the current todos with their ids and status.',
+    run: (_a, ctx) => listTodos(ctx) },
+
+  { name: 'remember', group: 'memory',
+    description: 'Save a durable fact about the user or project to long-term memory.',
+    parameters: { text: str('The fact to remember.') }, required: ['text'],
+    run: remember },
+
+  { name: 'exec_bash', group: 'shell', shell: true, mutating: true, concurrencySafe: false,
+    description: 'Run a single, one-shot shell command inside the working folder. Each call is a fresh process (no state carries over). For several related commands or anything needing state, use a console instead.',
+    parameters: { command: str('The shell command.') }, required: ['command'],
+    run: execBash },
+
+  { name: 'console_open', group: 'shell', concurrencySafe: false,
+    description: 'Open a persistent shell session (console) in the working folder. The working directory and environment persist across commands run in it. Returns a console id.',
+    parameters: { cwd: str('Optional starting sub-folder (relative to the working folder).') },
+    run: consoleOpen },
+
+  { name: 'console_exec', group: 'shell', shell: true, mutating: true, concurrencySafe: false,
+    description: 'Run a command in an open console. State (cwd, env, etc.) carries over between commands. Run long-running processes in the background with "&".',
+    parameters: { id: str('Console id from console_open.'), command: str('The shell command.') }, required: ['id', 'command'],
+    run: consoleExec },
+
+  { name: 'console_close', group: 'shell',
+    description: 'Close a console you no longer need.',
+    parameters: { id: str('Console id.') }, required: ['id'],
+    run: consoleClose },
+
+  { name: 'console_list', group: 'shell', readOnly: true,
+    description: 'List the currently open consoles and their state.',
+    run: (_a, ctx) => consoleList(ctx) },
+
+  { name: 'web_search', group: 'web', web: true,
+    description: 'Search the web and get a list of result titles, URLs and snippets. Use it to find sources, then web_fetch the most relevant URL to read it.',
+    parameters: { query: str('Search query.') }, required: ['query'],
+    run: webSearch },
+
+  { name: 'web_fetch', group: 'web', web: true,
+    description: 'Fetch a web page (or text resource) and return its readable text content. Use after web_search, or directly when you already know the URL.',
+    parameters: { url: str('Absolute URL to fetch.') }, required: ['url'],
+    run: webFetch },
+
+  { name: 'list_skills', group: 'agent', readOnly: true,
+    description: 'List the available skills (reusable Markdown playbooks) with their descriptions, so you can pick one to follow.',
+    run: listSkillsTool },
+
+  { name: 'run_skill', group: 'agent',
+    description: 'Load a skill playbook by name and follow its instructions. Use it when a task matches an available skill (see list_skills). The returned text is the playbook you should then execute.',
+    parameters: { name: str('Skill name (without the leading slash).'), arguments: str('Optional arguments / focus for the skill.') }, required: ['name'],
+    run: runSkillTool },
+
+  { name: 'create_skill', group: 'agent',
+    description: 'Create (or overwrite) a reusable skill — a Markdown playbook saved to the user skills folder, immediately available as a slash command. Use it when asked to make a new skill.',
+    parameters: {
+      name: str('Short kebab-case skill name (no leading slash).'),
+      description: str('One-line description shown in the skill list.'),
+      body: str('The playbook: imperative instructions for the assistant. Use $ARGUMENTS where the user input belongs.'),
+      argument_hint: str('Optional hint about expected arguments, e.g. "[path or focus]".'),
+      allowed_tools: str('Optional comma-separated list of tools the skill is allowed to use.')
+    }, required: ['name', 'body'],
+    run: createSkillTool },
+
+  { name: 'run_subagent', group: 'agent', concurrencySafe: false,
+    description: 'Delegate a focused, self-contained subtask to an isolated subagent with its own context. Best for parallelisable research/analysis ("examine module X and report"), to keep the main context lean. The subagent runs autonomously, read-only by default, and returns a text report. It cannot ask the user questions.',
+    parameters: {
+      task: str('The single, focused task for the subagent, written as a clear instruction.'),
+      context: str('Optional extra context/constraints the subagent needs.'),
+      mode: str('"read" (default, analysis only) or "write" (may edit files; only honoured outside Default permission mode).')
+    }, required: ['task'],
+    run: runSubagentTool }
+];
+
+/**
+ * One tool. Mirrors the `Tool` abstraction: schema generation, input
+ * validation, permission checking and read-only/destructive/concurrency
+ * predicates all derive from the {@link ToolDef} it wraps.
+ */
+class Tool {
+  constructor(def) {
+    this.def = def;
+    this.name = def.name;
+    this.description = def.description;
+    this.group = def.group;
+  }
+  /** JSON-schema for the tool's arguments. */
+  get inputSchema() {
+    return { type: 'object', properties: this.def.parameters || {}, required: this.def.required || [] };
+  }
+  /** Native function-calling schema sent to the model. */
+  schema() {
+    return { type: 'function', function: { name: this.name, description: this.description, parameters: this.inputSchema } };
+  }
+  prompt() { return this.description; }
+  isEnabled() { return this.def.enabled !== false; }
+  isReadOnly() { return !!this.def.readOnly; }
+  isMutating() { return !!this.def.mutating; }
+  isDestructive() { return !!this.def.destructive; }
+  isShell() { return !!this.def.shell; }
+  isWeb() { return !!this.def.web; }
+  isConcurrencySafe() { return this.def.concurrencySafe !== false; }
+  shouldDefer() { return !!this.def.defer; }
+  /** Return a human error string for missing required args, or null. */
+  validateInput(action) {
+    for (const key of (this.def.required || [])) {
+      if (action[key] == null || action[key] === '') return `Missing required argument "${key}".`;
     }
+    return null;
+  }
+  /** Which confirmation this tool needs in the given mode, or null. */
+  checkPermissions(mode) { return confirmKindFor(this.name, mode); }
+  execute(action, ctx) { return this.def.run(action, ctx); }
+}
+
+/** name → Tool */
+const REGISTRY = new Map(DEFS.map((d) => [d.name, new Tool(d)]));
+
+const getTool = (name) => REGISTRY.get(name);
+/** Discovery list (name + metadata) for the UI / subagents. */
+const listTools = () => [...REGISTRY.values()].map((t) => ({
+  name: t.name, description: t.description, group: t.group,
+  readOnly: t.isReadOnly(), mutating: t.isMutating(), destructive: t.isDestructive(),
+  shell: t.isShell(), web: t.isWeb(), concurrencySafe: t.isConcurrencySafe(), defer: t.shouldDefer()
+}));
+
+/** Names of read-only tools — the default toolset a subagent may use. */
+const READONLY_TOOLS = DEFS.filter((d) => d.readOnly).map((d) => d.name);
+
+/**
+ * Permission gate for a tool in a given mode — the single source of truth
+ * the agent loop consults (it no longer keeps its own hardcoded sets):
+ *   'bash' → shell command confirmation (default + tools-bypass)
+ *   'web'  → network-access confirmation (default)
+ *   'tool' → file-mutation confirmation (default)
+ *   null   → runs without confirmation
+ */
+function confirmKindFor(name, mode) {
+  const t = REGISTRY.get(name);
+  if (!t) return null;
+  if (t.isShell() && (mode === 'default' || mode === 'tools-bypass')) return 'bash';
+  if (mode === 'default' && t.isWeb()) return 'web';
+  if (mode === 'default' && t.isMutating()) return 'tool';
+  return null;
+}
+
+/** Set of tools that change files/system — used by the planning gate. */
+const MUTATING_TOOLS = new Set(DEFS.filter((d) => d.mutating).map((d) => d.name));
+
+/**
+ * Build the function-calling schema list.
+ * @param {Set<string>} [allowed] Restrict to these tool names (for subagents).
+ * @param {boolean} [includeDeferred] Include tools flagged `defer`.
+ */
+function buildSchemas(allowed, includeDeferred = false) {
+  return [...REGISTRY.values()]
+    .filter((t) => t.isEnabled() && (includeDeferred || !t.shouldDefer()))
+    .filter((t) => !allowed || allowed.has(t.name))
+    .map((t) => t.schema());
+}
+
+/** Default schema set sent to the model (all enabled, non-deferred tools). */
+const TOOL_SCHEMAS = buildSchemas();
+
+/* ---------------- dispatcher ---------------- */
+/**
+ * Execute one tool call.
+ * @param {Object} action  { tool, ...args }
+ * @param {Object} ctx
+ * @param {Set<string>} [allowed]  If given, reject tools outside this set.
+ */
+async function exec(action, ctx, allowed) {
+  const tool = REGISTRY.get(action.tool);
+  if (!tool) return { ok: false, summary: `unknown tool: ${action.tool}`, output: `Error: unknown tool "${action.tool}".` };
+  if (allowed && !allowed.has(action.tool)) {
+    return { ok: false, summary: `tool not allowed: ${action.tool}`, output: `Error: tool "${action.tool}" is not permitted in this context.` };
+  }
+  const invalid = tool.validateInput(action);
+  if (invalid) return { ok: false, summary: `${action.tool}: ${invalid}`, output: `Error: ${invalid}` };
+  try {
+    return await tool.execute(action, ctx);
   } catch (e) {
     return { ok: false, summary: `${action.tool || 'tool'} failed`, error: e.message, output: `Error: ${e.message}` };
   }
 }
 
-/* ---------------- tool schemas (native function-calling) ---------------- *
- * Sent to the model with each request so it calls tools with guaranteed-valid
- * JSON arguments instead of free-form text we have to parse.
- * ------------------------------------------------------------------------ */
-const fn = (name, description, properties = {}, required = []) => ({
-  type: 'function',
-  function: { name, description, parameters: { type: 'object', properties, required } }
-});
-const str = (description) => ({ type: 'string', description });
-
-const TOOL_SCHEMAS = [
-  fn('set_working_folder', 'Open a dialog asking the user to pick the folder to work in. Call first if no working folder is set and you need files.'),
-  fn('list_files', 'List files and directories at a path (relative to the working folder).', { path: str('Relative path; defaults to the folder root.') }),
-  fn('read_file', 'Read a file. Always read a file before editing or overwriting it.', { path: str('Relative path to the file.') }, ['path']),
-  fn('write_file', 'Create a new file or fully overwrite an existing one. Provide the COMPLETE file content. Prefer edit_file for changing part of an existing file.', { path: str('Relative path.'), content: str('Full file content.') }, ['path', 'content']),
-  fn('edit_file', 'Replace an exact snippet in an existing file. old_string must match the file exactly and be unique (add surrounding context to disambiguate), or set replace_all to replace every occurrence. Preferred way to change existing files.', {
-    path: str('Relative path.'),
-    old_string: str('Exact text to find (verbatim, including whitespace).'),
-    new_string: str('Replacement text. Empty string deletes the snippet.'),
-    replace_all: { type: 'boolean', description: 'Replace every occurrence instead of requiring a unique match.' }
-  }, ['path', 'old_string', 'new_string']),
-  fn('delete_file', 'Delete a file or folder.', { path: str('Relative path.') }, ['path']),
-  fn('add_todo', 'Add a concrete, verifiable step to the plan.', { text: str('What the step does.') }, ['text']),
-  fn('complete_todo', 'Mark a todo done.', { id: str('Todo id from list_todos.'), text: str('Or match by text.') }),
-  fn('list_todos', 'List the current todos with their ids and status.'),
-  fn('remember', 'Save a durable fact about the user or project to long-term memory.', { text: str('The fact to remember.') }, ['text']),
-  fn('exec_bash', 'Run a single, one-shot shell command inside the working folder. Each call is a fresh process (no state carries over). For several related commands or anything needing state, use a console instead.', { command: str('The shell command.') }, ['command']),
-  fn('console_open', 'Open a persistent shell session (console) in the working folder. The working directory and environment persist across commands run in it. Returns a console id.', { cwd: str('Optional starting sub-folder (relative to the working folder).') }),
-  fn('console_exec', 'Run a command in an open console. State (cwd, env, etc.) carries over between commands. Run long-running processes in the background with "&".', { id: str('Console id from console_open.'), command: str('The shell command.') }, ['id', 'command']),
-  fn('console_close', 'Close a console you no longer need.', { id: str('Console id.') }, ['id']),
-  fn('console_list', 'List the currently open consoles and their state.'),
-  fn('web_search', 'Search the web and get a list of result titles, URLs and snippets. Use it to find sources, then web_fetch the most relevant URL to read it.', { query: str('Search query.') }, ['query']),
-  fn('web_fetch', 'Fetch a web page (or text resource) and return its readable text content. Use after web_search, or directly when you already know the URL.', { url: str('Absolute URL to fetch.') }, ['url'])
-];
-
-module.exports = { exec, TOOL_SCHEMAS };
+module.exports = {
+  exec,
+  TOOL_SCHEMAS,
+  buildSchemas,
+  confirmKindFor,
+  MUTATING_TOOLS,
+  READONLY_TOOLS,
+  getTool,
+  listTools
+};

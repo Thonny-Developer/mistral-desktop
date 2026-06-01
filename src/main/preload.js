@@ -68,6 +68,24 @@ contextBridge.exposeInMainWorld('api', {
     }
   },
 
+  /* ---- skills (Markdown playbooks) ---- */
+  skills: {
+    list: () => ipcRenderer.invoke('skills:list'),
+    render: (name, args) => ipcRenderer.invoke('skills:render', name, args),
+    save: (skill) => ipcRenderer.invoke('skills:save', skill),
+    remove: (name) => ipcRenderer.invoke('skills:delete', name),
+    dir: () => ipcRenderer.invoke('skills:dir'),
+    openDir: () => ipcRenderer.invoke('skills:openDir')
+  },
+
+  /* ---- project file support ---- */
+  project: {
+    read: () => ipcRenderer.invoke('project:read'),
+    init: () => ipcRenderer.invoke('project:init'),
+    exists: () => ipcRenderer.invoke('project:exists'),
+    append: (notes) => ipcRenderer.invoke('project:append', notes)
+  },
+
   /* ---- context-window usage ---- */
   context: {
     stats: () => ipcRenderer.invoke('context:stats')

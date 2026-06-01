@@ -10,6 +10,7 @@ const SECTIONS = [
   ['model', 'Model'],
   ['output', 'Output'],
   ['memory', 'Memory'],
+  ['skills', 'Skills'],
   ['interface', 'Interface'],
   ['shortcuts', 'Shortcuts']
 ];
@@ -18,7 +19,6 @@ const SHORTCUTS = [
   ['New chat', 'Ctrl+N'],
   ['Command palette', 'Ctrl+K'],
   ['History', 'Ctrl+H'],
-  ['System prompt', 'Ctrl+P'],
   ['Settings', 'Ctrl+,'],
   ['Focus input', 'Ctrl+/'],
   ['Send message', 'Enter'],
@@ -57,7 +57,7 @@ async function render(container) {
 function drawSection(pane, settings) {
   ({
     api: drawApi, model: drawModel, output: drawOutput, memory: drawMemory,
-    interface: drawInterface, shortcuts: drawShortcuts
+    skills: drawSkills, interface: drawInterface, shortcuts: drawShortcuts
   }[activeSection])(pane, settings);
 }
 
@@ -301,6 +301,96 @@ async function drawMemory(pane, settings) {
     updateMeta();
     await api.memory.set('');
     toast(t('Memory cleared', locale), 'info', 1600);
+  });
+}
+
+/* ---------------- Skills section ---------------- */
+const SKILL_SOURCE_LABEL = { bundled: 'встроенный', user: 'пользовательский', project: 'проект' };
+
+async function drawSkills(pane, settings) {
+  const locale = settings.locale || 'ru';
+  let items = [];
+  try { items = await api.skills.list(); } catch { items = []; }
+  const dir = await api.skills.dir();
+
+  const rows = items.length
+    ? items.map((s) => `
+      <div class="setrow">
+        <div class="setlbl">
+          <div class="l1">/${escapeHtml(s.name)}
+            <span class="meta mono" style="font-size:10.5px;color:var(--ink-4);margin-left:6px">${SKILL_SOURCE_LABEL[s.source] || s.source}</span>
+          </div>
+          <div class="l2">${escapeHtml(s.description || '')}${s.argumentHint ? ` · ${escapeHtml(s.argumentHint)}` : ''}</div>
+        </div>
+        <div class="setctl" style="display:flex;align-items:center;gap:10px;justify-content:flex-end">
+          ${s.allowedTools && s.allowedTools.length
+            ? `<span class="meta mono" style="font-size:10.5px;color:var(--ink-3)">${escapeHtml(s.allowedTools.join(', '))}</span>`
+            : '<span class="meta mono" style="font-size:10.5px;color:var(--ink-4)">все инструменты</span>'}
+          ${s.source === 'user' ? `<button class="btn ghost sm danger skill-del" data-name="${escapeHtml(s.name)}">Удалить</button>` : ''}
+        </div>
+      </div>`).join('')
+    : '<div class="set-sub">Пока нет скиллов. Создайте ниже или положите .md в пользовательскую папку.</div>';
+
+  pane.innerHTML = `
+    <div class="set-section">
+      <div class="set-h">${t('Skills', locale)}</div>
+      <div class="set-sub">Переиспользуемые Markdown-плейбуки. Вызывайте их как /команду в чате; ассистент тоже может применять их сам.</div>
+      ${rows}
+      <div style="display:flex;gap:10px;margin-top:16px">
+        <button class="btn ghost sm" id="skillsOpen">Открыть папку скиллов</button>
+        <button class="btn ghost sm" id="skillsRefresh">Обновить</button>
+      </div>
+      <div class="meta mono" style="font-size:10.5px;color:var(--ink-4);margin-top:10px">${escapeHtml(dir)}</div>
+
+      <div class="set-h" style="margin-top:26px">Новый скилл</div>
+      <div class="set-sub">Опишите шаги — или попросите ассистента в чате: <span class="mono">/skill-creator …</span></div>
+
+      <div class="setrow">
+        <div class="setlbl"><div class="l1">Имя</div><div class="l2">kebab-case, без слеша</div></div>
+        <div class="setctl"><input class="field-box" id="skName" placeholder="my-skill" style="width:100%" /></div>
+      </div>
+      <div class="setrow">
+        <div class="setlbl"><div class="l1">Описание</div></div>
+        <div class="setctl"><input class="field-box" id="skDesc" placeholder="Что делает скилл" style="width:100%" /></div>
+      </div>
+      <div class="setrow">
+        <div class="setlbl"><div class="l1">Подсказка аргументов</div><div class="l2">необязательно</div></div>
+        <div class="setctl"><input class="field-box" id="skHint" placeholder="[путь или фокус]" style="width:100%" /></div>
+      </div>
+      <div class="setrow">
+        <div class="setlbl"><div class="l1">Разрешённые инструменты</div><div class="l2">через запятую · пусто = все</div></div>
+        <div class="setctl"><input class="field-box" id="skTools" placeholder="read_file, list_files, edit_file" style="width:100%" /></div>
+      </div>
+      <textarea class="field-box" id="skBody" placeholder="Инструкции ассистенту. Используйте $ARGUMENTS там, где подставляется ввод пользователя."
+        style="width:100%;min-height:180px;resize:vertical;line-height:1.6;margin-top:6px"></textarea>
+      <div style="display:flex;gap:10px;margin-top:12px">
+        <button class="btn primary sm" id="skSave">Создать скилл</button>
+      </div>
+    </div>`;
+
+  pane.querySelector('#skillsOpen').addEventListener('click', () => api.skills.openDir());
+  pane.querySelector('#skillsRefresh').addEventListener('click', () => drawSkills(pane, settings));
+  pane.querySelectorAll('.skill-del').forEach((btn) =>
+    btn.addEventListener('click', async () => {
+      await api.skills.remove(btn.dataset.name);
+      toast('Скилл удалён', 'info', 1600);
+      drawSkills(pane, settings);
+    }));
+
+  pane.querySelector('#skSave').addEventListener('click', async () => {
+    const name = pane.querySelector('#skName').value.trim();
+    const body = pane.querySelector('#skBody').value.trim();
+    if (!name) { pane.querySelector('#skName').classList.add('invalid'); toast('Укажите имя скилла', 'error'); return; }
+    if (!body) { pane.querySelector('#skBody').classList.add('invalid'); toast('Заполните тело скилла', 'error'); return; }
+    const r = await api.skills.save({
+      name,
+      description: pane.querySelector('#skDesc').value.trim(),
+      argumentHint: pane.querySelector('#skHint').value.trim(),
+      allowedTools: pane.querySelector('#skTools').value.trim(),
+      body
+    });
+    toast(`Скилл /${r.name} создан`, 'success', 2000);
+    drawSkills(pane, settings);
   });
 }
 

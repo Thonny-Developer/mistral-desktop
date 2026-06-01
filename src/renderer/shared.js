@@ -16,7 +16,6 @@ export const LOCALES = {
     Chat: 'Chat',
     Settings: 'Settings',
     History: 'History',
-    'System Prompt': 'System Prompt',
     About: 'About',
     Menu: 'Menu',
     'New chat': 'New chat',
@@ -31,7 +30,6 @@ export const LOCALES = {
     Open: 'Open',
     Export: 'Export',
     Delete: 'Delete',
-    'Edit system prompt': 'Edit system prompt',
     'No matching commands': 'No matching commands',
     'No API key set — open Settings to connect to Mistral.': 'No API key set — open Settings to connect to Mistral.',
     msgs: 'msgs',
@@ -91,6 +89,7 @@ export const LOCALES = {
     'Font size': 'Font size',
     'Keyboard reference': 'Keyboard reference',
     Shortcuts: 'Shortcuts',
+    Skills: 'Skills',
     Language: 'Language',
     'App interface language': 'App interface language',
     'API key saved': 'API key saved',
@@ -119,7 +118,6 @@ export const LOCALES = {
     Chat: 'Чат',
     Settings: 'Настройки',
     History: 'История',
-    'System Prompt': 'Системный промпт',
     About: 'О приложении',
     Menu: 'Меню',
     'New chat': 'Новый чат',
@@ -134,7 +132,6 @@ export const LOCALES = {
     Open: 'Открыть',
     Export: 'Экспорт',
     Delete: 'Удалить',
-    'Edit system prompt': 'Редактировать системный промпт',
     'No matching commands': 'Команды не найдены',
     'No API key set — open Settings to connect to Mistral.': 'API ключ не установлен — откройте Настройки.',
     msgs: 'сообщ.',
@@ -200,6 +197,7 @@ export const LOCALES = {
     'Font size': 'Размер шрифта',
     'Keyboard reference': 'Справочник клавиш',
     Shortcuts: 'Сочетания клавиш',
+    Skills: 'Скиллы',
     Language: 'Язык',
     'App interface language': 'Язык интерфейса',
     'API key saved': 'API ключ сохранён',
@@ -355,6 +353,23 @@ export function renderMarkdown(text) {
     btn.textContent = 'copy';
     wrap.appendChild(btn);
   });
+
+  // Reasoning blocks (`<details><summary>Рассуждает</summary>…`) get a token
+  // estimate appended to the summary, so you can see how much the thinking
+  // cost. Those tokens are part of the message and already count toward the
+  // context window. Runs on every render path (live, committed, history).
+  tmp.querySelectorAll('details').forEach((d) => {
+    const summary = d.querySelector('summary');
+    if (!summary || summary.querySelector('.reason-tok')) return;
+    const bodyLen = Math.max(0, (d.textContent || '').length - (summary.textContent || '').length);
+    const toks = Math.ceil(bodyLen / 4);
+    if (!toks) return;
+    const span = document.createElement('span');
+    span.className = 'reason-tok';
+    span.textContent = ` · ~${toks.toLocaleString()} ток.`;
+    summary.appendChild(span);
+  });
+
   return tmp.innerHTML;
 }
 
@@ -429,7 +444,6 @@ export const ICONS = {
   chat: '<path d="M3 5.5h14v8H9l-3 3v-3H3z"/>',
   settings: '<path d="M4 6h12M4 10h12M4 14h12"/><circle cx="8" cy="6" r="2"/><circle cx="13" cy="10" r="2"/><circle cx="7" cy="14" r="2"/>',
   history: '<circle cx="10" cy="10" r="7"/><path d="M10 6v4l3 2"/>',
-  prompt: '<path d="M4 6l3.5 3L4 12"/><path d="M10 13h6"/>',
   about: '<circle cx="10" cy="10" r="7"/><path d="M10 9v4.5"/><circle cx="10" cy="6.4" r=".5" fill="currentColor" stroke="none"/>'
 };
 export const navSvg = (k) => `<svg viewBox="0 0 20 20" aria-hidden="true">${ICONS[k]}</svg>`;

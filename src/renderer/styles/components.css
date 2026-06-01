@@ -196,6 +196,45 @@ select.field-box { appearance: none; cursor: pointer; background-image: none; }
   background: var(--panel-2); border: 1px solid var(--line-strong); border-radius: 8px;
   box-shadow: 0 18px 44px -18px rgba(0, 0, 0, .85); overflow: hidden; animation: paletteIn .12s ease;
 }
+.slash-suggestions {
+  position: fixed; z-index: 130; background: var(--panel-2); border: 1px solid var(--line-strong);
+  border-radius: 10px; box-shadow: 0 18px 44px -18px rgba(0, 0, 0, .85); overflow: hidden;
+  font-size: 13px; max-height: 240px; overflow-y: auto;
+}
+.slash-suggestion {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 10px 12px; cursor: pointer; color: var(--ink-2);
+}
+.slash-suggestion.active,
+.slash-suggestion:hover {
+  background: var(--panel-3); color: var(--ink);
+}
+.slash-suggestion .cmd { font-family: var(--mono); color: var(--accent); }
+.slash-suggestion .desc { flex: 1; text-align: right; font-size: 12px; color: var(--ink-3); }
+.skill-used {
+  display: inline-flex; align-items: center; gap: 6px; margin-bottom: 8px;
+  padding: 3px 9px; border-radius: 999px; font-size: 11.5px;
+  font-family: var(--mono); color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.skill-used b { font-weight: 600; }
+.reason-tok { color: var(--ink-4); font-family: var(--mono); font-size: 11px; font-weight: 400; }
+
+/* image attachments in the composer */
+.composer.dragover { outline: 1px dashed var(--accent); outline-offset: -3px; }
+.composer-atts { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 4px 2px; }
+.att-thumb { position: relative; width: 64px; height: 64px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line-strong); }
+.att-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.att-del {
+  position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; line-height: 16px;
+  border-radius: 50%; border: none; cursor: pointer; font-size: 13px; padding: 0;
+  color: #fff; background: rgba(0, 0, 0, .62);
+}
+.att-del:hover { background: rgba(0, 0, 0, .85); }
+/* images inside a sent message bubble */
+.bubble-imgs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.bubble-img { max-width: 260px; max-height: 200px; border-radius: 8px; border: 1px solid var(--line); display: block; }
 .todos-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--line); }
 .todos-list { max-height: 320px; overflow-y: auto; padding: 6px; }
 .todo-item { display: flex; align-items: flex-start; gap: 10px; padding: 8px 9px; border-radius: var(--r); cursor: pointer; }
@@ -354,6 +393,13 @@ select.field-box { appearance: none; cursor: pointer; background-image: none; }
 .stream-cursor { display: inline-block; width: 7px; color: var(--accent); animation: blink 1s step-end infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 
+/* streaming text reveal — each freshly-arrived chunk fades in on its own,
+   so letters appear as tokens land without re-animating earlier text */
+.md-live { white-space: pre-wrap; }
+.md-head:not(:empty) { margin-bottom: 10px; }
+@keyframes tokIn { from { opacity: 0; filter: blur(6px); } to { opacity: 1; filter: blur(0); } }
+.tok { animation: tokIn .42s cubic-bezier(.22, .61, .36, 1) both; }
+
 /* input bar */
 .composer { padding: 14px 20px 16px; border-top: 1px solid var(--line); }
 .composer textarea {
@@ -414,6 +460,9 @@ select.field-box { appearance: none; cursor: pointer; background-image: none; }
 .hist-toolbar { display: flex; align-items: center; gap: 12px; padding: 14px 24px; border-bottom: 1px solid var(--line); }
 .hist-toolbar .searchbox { flex: 1; max-width: 340px; border: 1px solid var(--line-2); border-radius: var(--r); background: var(--panel); padding: 8px 11px; }
 .hist-count { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+.hist-loading { display: flex; flex-direction: column; gap: 12px; padding: 18px 24px; }
+.hist-loading-row { display: flex; flex-direction: column; gap: 8px; padding: 14px 16px; border-radius: 12px; background: var(--panel-2); border: 1px solid var(--line-2); }
+.hist-loading-row .bars { display: flex; gap: 10px; align-items: center; }
 
 .bulk-bar {
   display: flex; align-items: center; gap: 14px; padding: 9px 24px;
