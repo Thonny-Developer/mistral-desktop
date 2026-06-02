@@ -405,7 +405,7 @@ async function drawInterface(pane, settings) {
       <div class="setrow">
         <div class="setlbl"><div class="l1">${t('Theme', locale)}</div><div class="l2">${t('Applies immediately', locale)}</div></div>
         <div class="seg-group" id="theme">
-          ${[['dark', t('Dark', locale)], ['oled', 'OLED'], ['dim', t('Dim', locale)]].map(([v, l]) =>
+          ${[['dark', t('Dark', locale)], ['oled', 'OLED'], ['dim', t('Dim', locale)], ['solarized-light', 'Solarized'], ['gruvbox', 'Gruvbox'], ['nord', 'Nord']].map(([v, l]) =>
             `<button class="seg ${settings.theme === v ? 'active' : ''}" data-v="${v}">${l}</button>`).join('')}
         </div>
       </div>

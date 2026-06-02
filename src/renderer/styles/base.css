@@ -60,6 +60,81 @@
   --ink-2:   #b2b2b9;
 }
 
+/* Solarized Light — warm paper, low-glare light theme */
+:root[data-theme="solarized-light"] {
+  --bg:          #fdf6e3;
+  --canvas:      #eee8d5;
+  --panel:       #eee8d5;
+  --panel-2:     #e4ddc7;
+  --panel-3:     #dcd4bb;
+  --line:        #d9d2ba;
+  --line-2:      #cabf9c;
+  --line-strong: #b9ac82;
+
+  --ink:    #586e75;
+  --ink-2:  #657b83;
+  --ink-3:  #839496;
+  --ink-4:  #93a1a1;
+
+  --skel:   #e4ddc7;
+  --skel-2: #d9d2ba;
+
+  --accent:     #cb4b16;
+  --accent-dim: #e6b89c;
+  --ok:         #859900;
+  --danger:     #dc322f;
+}
+
+/* Gruvbox — retro warm dark */
+:root[data-theme="gruvbox"] {
+  --bg:          #1d2021;
+  --canvas:      #282828;
+  --panel:       #282828;
+  --panel-2:     #32302f;
+  --panel-3:     #3c3836;
+  --line:        #504945;
+  --line-2:      #665c54;
+  --line-strong: #7c6f64;
+
+  --ink:    #ebdbb2;
+  --ink-2:  #d5c4a1;
+  --ink-3:  #a89984;
+  --ink-4:  #7c6f64;
+
+  --skel:   #32302f;
+  --skel-2: #3c3836;
+
+  --accent:     #fe8019;
+  --accent-dim: #8a4d1a;
+  --ok:         #b8bb26;
+  --danger:     #fb4934;
+}
+
+/* Nord — cool arctic dark */
+:root[data-theme="nord"] {
+  --bg:          #2e3440;
+  --canvas:      #323846;
+  --panel:       #323846;
+  --panel-2:     #3b4252;
+  --panel-3:     #434c5e;
+  --line:        #434c5e;
+  --line-2:      #4c566a;
+  --line-strong: #5b677b;
+
+  --ink:    #eceff4;
+  --ink-2:  #d8dee9;
+  --ink-3:  #abb4c4;
+  --ink-4:  #7b8494;
+
+  --skel:   #3b4252;
+  --skel-2: #434c5e;
+
+  --accent:     #88c0d0;
+  --accent-dim: #3f5560;
+  --ok:         #a3be8c;
+  --danger:     #bf616a;
+}
+
 * { box-sizing: border-box; }
 
 html, body {
