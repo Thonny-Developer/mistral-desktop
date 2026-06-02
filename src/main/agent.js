@@ -155,7 +155,9 @@ async function run({ baseMessages, settings, apiKey, signal, emit, requestApprov
         apiKey,
         signal,
         tools: toolSchemas,
-        onToken: (delta) => { text += delta; emit({ type: 'token', delta }); }
+        onToken: (delta) => { text += delta; emit({ type: 'token', delta }); },
+        // Rate limited → tell the UI we're waiting and will retry (no rollback).
+        onRetry: (info) => emit({ type: 'rate-limit-wait', ...info })
       });
     } catch (e) {
       if (e.code === 'aborted') { emit({ type: 'done', content: '', aborted: true }); return; }
@@ -297,7 +299,8 @@ async function runSubagent({ task, focus, mode, settings, apiKey, signal, emit, 
     try {
       result = await mistral.sendMessage({
         messages: work, settings, apiKey, signal, tools: schemas,
-        onToken: (d) => { text += d; } // accumulate only — never leak to the main stream
+        onToken: (d) => { text += d; }, // accumulate only — never leak to the main stream
+        onRetry: (info) => emit?.({ type: 'rate-limit-wait', ...info, subagent: true })
       });
     } catch (e) {
       if (e.code === 'aborted') { emit?.({ type: 'subagent-done', aborted: true }); return { text: finalText, aborted: true }; }

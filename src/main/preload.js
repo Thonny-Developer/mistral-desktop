@@ -78,6 +78,11 @@ contextBridge.exposeInMainWorld('api', {
     openDir: () => ipcRenderer.invoke('skills:openDir')
   },
 
+  /* ---- attachment text extraction (docs/binaries dropped in the composer) ---- */
+  docs: {
+    extract: (payload) => ipcRenderer.invoke('docs:extract', payload)
+  },
+
   /* ---- project file support ---- */
   project: {
     read: () => ipcRenderer.invoke('project:read'),

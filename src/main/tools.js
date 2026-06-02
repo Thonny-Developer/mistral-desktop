@@ -19,8 +19,10 @@ const fsp = require('fs/promises');
 const path = require('path');
 const { exec: execCommand } = require('child_process');
 const skills = require('./skills');
+const extract = require('./extract');
 
 const MAX_READ_BYTES = 20_000; // keep file reads from blowing the context window
+const MAX_EXTRACT_CHARS = 40_000; // extracted document text is the payload, so allow more
 const IGNORE = new Set(['node_modules', '.git', '.DS_Store']);
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -72,9 +74,55 @@ async function listFiles(a, ctx) {
 async function readFile(a, ctx) {
   if (!a.path) throw new Error('read_file requires "path".');
   const abs = resolveInWork(ctx, a.path);
+  // Documents (PDF/DOCX/PPTX/…) and binaries are not UTF-8 text — reading them
+  // raw would dump garbage into the context. Route them through extract_file so
+  // only the pulled-out text enters the window.
+  if (extract.isBinaryDoc(abs)) {
+    return extractFile(a, ctx);
+  }
   const buf = await fsp.readFile(abs, 'utf-8');
   const out = buf.length > MAX_READ_BYTES ? buf.slice(0, MAX_READ_BYTES) + '\n…(truncated)' : buf;
   return { ok: true, summary: `read ${a.path} (${buf.length} B)`, output: out || '(empty file)' };
+}
+
+// Pull plain text out of a document/binary (PDF, DOCX, PPTX, XLSX, ODF, EPUB,
+// ZIP). Only the extracted text — never the raw bytes — enters the context.
+// For formats without a built-in extractor, the agent is told to write its own
+// (a small script via a console) and feed back only what it extracted.
+async function extractFile(a, ctx) {
+  if (!a.path) throw new Error('extract_file requires "path".');
+  const abs = resolveInWork(ctx, a.path);
+  if (!fs.existsSync(abs)) {
+    return { ok: false, summary: `not found: ${a.path}`, output: `Error: ${a.path} does not exist.` };
+  }
+  const r = extract.extractFile(abs);
+  if (!r.ok) {
+    return {
+      ok: false,
+      summary: `Нет извлекателя для .${r.ext} · ${a.path}`,
+      output: `Не удалось извлечь "${a.path}" (${r.error}). Для этого формата нет встроенного метода. ` +
+        `Напишите свой извлекатель: откройте консоль (console_open) и небольшим скриптом (например на Python/Node, ` +
+        `используя то, что есть в системе) превратите файл в обычный текст, выведите ТОЛЬКО извлечённый текст и работайте с ним. ` +
+        `Не загружайте в контекст сырые байты файла.`
+    };
+  }
+  const text = r.text || '';
+  if (!text.trim()) {
+    return {
+      ok: true,
+      summary: `Извлечено пусто · ${a.path}`,
+      output: `Файл "${a.path}" (.${r.ext}) разобран, но текста в нём не нашлось ` +
+        `(возможно, это сканы/изображения или нестандартная структура). Если нужен текст — извлеките его другим способом.`
+    };
+  }
+  const out = text.length > MAX_EXTRACT_CHARS
+    ? text.slice(0, MAX_EXTRACT_CHARS) + '\n…(извлечённый текст обрезан)'
+    : text;
+  return {
+    ok: true,
+    summary: `Извлёк текст из ${a.path} (.${r.ext}, ${text.length} симв.)`,
+    output: out
+  };
 }
 
 async function writeFile(a, ctx) {
@@ -468,25 +516,30 @@ const bool = (description) => ({ type: 'boolean', description });
 /** @type {ToolDef[]} */
 const DEFS = [
   { name: 'set_working_folder', group: 'fs', concurrencySafe: false,
-    description: 'Open a dialog asking the user to pick the folder to work in. Call first if no working folder is set and you need files.',
+    description: 'Open a dialog asking the user to pick the project folder to work in. If you start a file or shell action without a folder set, the app prompts for it automatically — so you only need this to set or change the folder explicitly.',
     run: (_a, ctx) => pickFolder(ctx) },
 
-  { name: 'list_files', group: 'fs', readOnly: true,
+  { name: 'list_files', group: 'fs', readOnly: true, needsWork: true,
     description: 'List files and directories at a path (relative to the working folder).',
     parameters: { path: str('Relative path; defaults to the folder root.') },
     run: listFiles },
 
-  { name: 'read_file', group: 'fs', readOnly: true,
-    description: 'Read a file. Always read a file before editing or overwriting it.',
+  { name: 'read_file', group: 'fs', readOnly: true, needsWork: true,
+    description: 'Read a file. Always read a file before editing or overwriting it. For documents (PDF, DOCX, PPTX, XLSX, …) it automatically extracts the text instead of returning raw bytes.',
     parameters: { path: str('Relative path to the file.') }, required: ['path'],
     run: readFile },
 
-  { name: 'write_file', group: 'fs', mutating: true, concurrencySafe: false,
+  { name: 'extract_file', group: 'fs', readOnly: true, needsWork: true,
+    description: 'Extract plain text from a document or binary file (PDF, DOCX, PPTX, XLSX, ODT/ODP/ODS, EPUB, ZIP). Only the extracted text enters the context, never the raw bytes. If a format has no built-in extractor it tells you so — then write your own extractor (a small script in a console) and feed back only the extracted text.',
+    parameters: { path: str('Relative path to the document.') }, required: ['path'],
+    run: extractFile },
+
+  { name: 'write_file', group: 'fs', mutating: true, concurrencySafe: false, needsWork: true,
     description: 'Create a new file or fully overwrite an existing one. Provide the COMPLETE file content. Prefer edit_file for changing part of an existing file.',
     parameters: { path: str('Relative path.'), content: str('Full file content.') }, required: ['path', 'content'],
     run: writeFile },
 
-  { name: 'edit_file', group: 'fs', mutating: true, concurrencySafe: false,
+  { name: 'edit_file', group: 'fs', mutating: true, concurrencySafe: false, needsWork: true,
     description: 'Replace an exact snippet in an existing file. old_string must match the file exactly and be unique (add surrounding context to disambiguate), or set replace_all to replace every occurrence. Preferred way to change existing files.',
     parameters: {
       path: str('Relative path.'),
@@ -496,7 +549,7 @@ const DEFS = [
     }, required: ['path', 'old_string', 'new_string'],
     run: editFile },
 
-  { name: 'delete_file', group: 'fs', mutating: true, destructive: true, concurrencySafe: false,
+  { name: 'delete_file', group: 'fs', mutating: true, destructive: true, concurrencySafe: false, needsWork: true,
     description: 'Delete a file or folder.',
     parameters: { path: str('Relative path.') }, required: ['path'],
     run: deleteFile },
@@ -520,17 +573,17 @@ const DEFS = [
     parameters: { text: str('The fact to remember.') }, required: ['text'],
     run: remember },
 
-  { name: 'exec_bash', group: 'shell', shell: true, mutating: true, concurrencySafe: false,
+  { name: 'exec_bash', group: 'shell', shell: true, mutating: true, concurrencySafe: false, needsWork: true,
     description: 'Run a single, one-shot shell command inside the working folder. Each call is a fresh process (no state carries over). For several related commands or anything needing state, use a console instead.',
     parameters: { command: str('The shell command.') }, required: ['command'],
     run: execBash },
 
-  { name: 'console_open', group: 'shell', concurrencySafe: false,
+  { name: 'console_open', group: 'shell', concurrencySafe: false, needsWork: true,
     description: 'Open a persistent shell session (console) in the working folder. The working directory and environment persist across commands run in it. Returns a console id.',
     parameters: { cwd: str('Optional starting sub-folder (relative to the working folder).') },
     run: consoleOpen },
 
-  { name: 'console_exec', group: 'shell', shell: true, mutating: true, concurrencySafe: false,
+  { name: 'console_exec', group: 'shell', shell: true, mutating: true, concurrencySafe: false, needsWork: true,
     description: 'Run a command in an open console. State (cwd, env, etc.) carries over between commands. Run long-running processes in the background with "&".',
     parameters: { id: str('Console id from console_open.'), command: str('The shell command.') }, required: ['id', 'command'],
     run: consoleExec },
@@ -612,6 +665,7 @@ class Tool {
   isShell() { return !!this.def.shell; }
   isWeb() { return !!this.def.web; }
   isConcurrencySafe() { return this.def.concurrencySafe !== false; }
+  needsWorkingFolder() { return !!this.def.needsWork; }
   shouldDefer() { return !!this.def.defer; }
   /** Return a human error string for missing required args, or null. */
   validateInput(action) {
@@ -689,6 +743,22 @@ async function exec(action, ctx, allowed) {
   }
   const invalid = tool.validateInput(action);
   if (invalid) return { ok: false, summary: `${action.tool}: ${invalid}`, output: `Error: ${invalid}` };
+  // Before ANY file/shell action, make sure a project folder is chosen. If none
+  // is set yet, prompt the user to pick the project directory (native dialog)
+  // and only then run the action — so the assistant never touches files without
+  // a folder, and the user is asked exactly once, when it first matters.
+  if (tool.needsWorkingFolder() && !ctx.store.get('workingDir')) {
+    const picked = await pickFolder(ctx);
+    if (!picked.ok) {
+      return {
+        ok: false,
+        summary: 'папка проекта не выбрана',
+        output: 'Для работы с файлами нужно выбрать папку проекта, но выбор отменён. Действие не выполнено — попросите пользователя указать папку или повторите, когда она будет выбрана.'
+      };
+    }
+    // Surface the folder choice in the chat (and refresh the folder chip).
+    ctx.emit?.({ type: 'tool', name: 'set_working_folder', ok: true, summary: picked.summary, workspaceChanged: true });
+  }
   try {
     return await tool.execute(action, ctx);
   } catch (e) {

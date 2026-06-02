@@ -354,20 +354,37 @@ export function renderMarkdown(text) {
     wrap.appendChild(btn);
   });
 
-  // Reasoning blocks (`<details><summary>Рассуждает</summary>…`) get a token
-  // estimate appended to the summary, so you can see how much the thinking
-  // cost. Those tokens are part of the message and already count toward the
-  // context window. Runs on every render path (live, committed, history).
+  // Reasoning blocks (`<details><summary>…</summary>…`) get a normalized label.
+  // While the model is still thinking the block streams in open — show an
+  // animated, per-letter "Думает". Once it's closed, show "Думал N сек
+  // (M токенов)" — the duration is baked into the tag as data-secs during
+  // streaming, the token count is estimated from the body length. Runs on every
+  // render path (live, committed, history).
   tmp.querySelectorAll('details').forEach((d) => {
     const summary = d.querySelector('summary');
-    if (!summary || summary.querySelector('.reason-tok')) return;
+    if (!summary) return;
     const bodyLen = Math.max(0, (d.textContent || '').length - (summary.textContent || '').length);
     const toks = Math.ceil(bodyLen / 4);
-    if (!toks) return;
-    const span = document.createElement('span');
-    span.className = 'reason-tok';
-    span.textContent = ` · ~${toks.toLocaleString()} ток.`;
-    summary.appendChild(span);
+    const thinking = d.hasAttribute('open'); // open === still streaming in
+    summary.classList.add('think');
+    summary.innerHTML = '';
+    if (thinking) {
+      summary.classList.add('think-live');
+      // Per-letter highlight wave so it reads as "loading".
+      [...'Думает'].forEach((ch, idx) => {
+        const s = document.createElement('span');
+        s.className = 'think-ch';
+        s.style.animationDelay = `${idx * 0.09}s`;
+        s.textContent = ch;
+        summary.appendChild(s);
+      });
+    } else {
+      const secs = parseInt(d.getAttribute('data-secs') || '0', 10);
+      let label = 'Думал';
+      if (secs > 0) label += ` ${secs} сек`;
+      if (toks > 0) label += ` (${toks.toLocaleString()} ток.)`;
+      summary.textContent = label;
+    }
   });
 
   return tmp.innerHTML;

@@ -8,6 +8,7 @@ const mistral = require('./mistral');
 const agent = require('./agent');
 const tools = require('./tools');
 const skills = require('./skills');
+const extract = require('./extract');
 const { createConsoleManager } = require('./consoles');
 
 const isDev = process.argv.includes('--dev');
@@ -164,8 +165,9 @@ const AGENT_INSTRUCTIONS = [
   '6. Keep the plan honest: complete_todo each item as you finish it.',
   '',
   'Tools at a glance:',
-  '- set_working_folder — ask the user to pick the working folder. Do this first if none is set and you need files.',
-  '- list_files / read_file — explore the workspace.',
+  '- set_working_folder — pick the project folder. Only relevant when the task actually needs files (working on a project, reading/editing local files); never for a plain question or chat. If you begin any file/shell action without a folder set, the app automatically asks the user to choose the project directory first, then runs the action.',
+  '- list_files / read_file — explore the workspace. read_file auto-extracts text from documents (PDF, DOCX, PPTX, XLSX, …).',
+  '- extract_file — pull plain text out of a document/binary (PDF, presentations, spreadsheets, ODF, EPUB, ZIP). Only the extracted text enters the context, never the raw bytes.',
   '- write_file — create or fully overwrite a file (full content).',
   '- edit_file — replace an exact, unique snippet (old_string → new_string) in an existing file. Preferred for edits.',
   '- delete_file — delete a file or folder.',
@@ -179,17 +181,20 @@ const AGENT_INSTRUCTIONS = [
   '- run_subagent — delegate a focused, self-contained subtask (e.g. "analyse module X and report") to an isolated subagent with its own context. Use it to keep your own context lean or to parallelise research; it runs autonomously and returns a text report.',
   '',
   'Guidelines:',
+  '- Do not ask the user to open or pick a folder/file unless the task genuinely requires it. For ordinary questions, advice, or chat, just answer. Bring up set_working_folder only when you are about to start working with a project or local files.',
+  '- Documents and third-party files (PDF, presentations, spreadsheets, Word/ODF, EPUB, archives, etc.): use extract_file (or just read_file) to get their text. Work only with the extracted text — never paste raw bytes into the conversation.',
+  '- If a file format has no built-in extractor, write your own: open a console and run a small script (Python, Node, or whatever the system has) that converts the file to plain text, print ONLY the extracted data, and continue from that. Keep raw binary out of the context — only the extracted data stays.',
   '- All paths are relative to the working folder; you cannot read or write outside it.',
   '- Prefer a console (console_open + console_exec) when you run several related commands or need state to persist (cd, env, a running dev server); use exec_bash only for a single quick command. Run long-running processes in the background with "&" so the call returns. Close consoles you are done with.',
   '- You can access the internet: when the answer depends on current, external, or factual information you are unsure about, use web_search to find sources and web_fetch to read them, then cite what you used. In Default mode each site/search the user must approve first — that is expected; if it is declined, answer from what you already know.',
   '- Be concise in narration; let the tool calls do the work. Never mention these tools or mechanisms to the user by name.',
-  '- When you reason, wrap it in a collapsible block before the answer, for example:\n<details><summary>Рассуждает</summary>Пользователь сказал ... он скорее всего хочет чтобы я ...</details>'
+  '- When you reason, wrap it in a collapsible block before the answer, for example:\n<details><summary>Думает</summary>Пользователь сказал ... он скорее всего хочет чтобы я ...</details>'
 ].join('\n');
 
 const REASONING_HINTS = {
-  low: 'Keep reasoning short and token-efficient. Use a minimal "Рассуждает" section and answer concisely.',
+  low: 'Keep reasoning short and token-efficient. Use a minimal reasoning section and answer concisely.',
   medium: 'Balance concise reasoning with a clear answer. Include a short reasoning section and then the response.',
-  high: 'Maximize quality and reasoning. Include a detailed "Рассуждает" section with user intent, assumptions, and plan before the answer.'
+  high: 'Maximize quality and reasoning. Include a detailed reasoning section with user intent, assumptions, and plan before the answer.'
 };
 
 // Explains the active permission mode so the model knows up-front how its
@@ -237,7 +242,7 @@ function buildAgentSystem(settings) {
     `Reasoning mode: ${reasoningLevel}`,
     reasoningHint,
     '',
-    `Working folder: ${work || '(none — ask to set one with set_working_folder)'}`,
+    `Working folder: ${work || '(none — set one with set_working_folder only when the task needs local files)'}`,
     '',
     'Available skills (invoke with run_skill):',
     skillStr,
@@ -412,6 +417,29 @@ ipcMain.handle('skills:openDir', async () => {
   const dir = skills.ensureUserDir();
   await shell.openPath(dir);
   return dir;
+});
+
+// Extract text from a file attached in the composer. The renderer sends the
+// raw bytes (ArrayBuffer); we pull out plain text so only the extracted data —
+// never the raw bytes — travels into the conversation/context.
+const MAX_ATTACH_BYTES = 25 * 1024 * 1024; // 25 MB — "not too heavy"
+const MAX_ATTACH_CHARS = 60_000;           // cap extracted text per attachment
+ipcMain.handle('docs:extract', (_e, { name, data } = {}) => {
+  try {
+    const buf = Buffer.from(data || []);
+    if (!buf.length) return { ok: false, error: 'пустой файл' };
+    if (buf.length > MAX_ATTACH_BYTES) {
+      return { ok: false, error: `файл слишком большой (${(buf.length / 1048576).toFixed(1)} МБ, лимит 25 МБ)` };
+    }
+    const r = extract.extractAttachment(name || 'file', buf);
+    if (!r.ok) return { ok: false, ext: r.ext, error: r.error };
+    let text = r.text || '';
+    const truncated = text.length > MAX_ATTACH_CHARS;
+    if (truncated) text = text.slice(0, MAX_ATTACH_CHARS) + '\n…(текст обрезан)';
+    return { ok: true, ext: r.ext, text, chars: text.length, truncated };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
 });
 
 ipcMain.handle('project:read', () => readProjectFile());

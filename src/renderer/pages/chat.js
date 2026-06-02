@@ -19,7 +19,6 @@ const permLabel = (id) => (PERM_MODES.find((m) => m.id === id) || PERM_MODES[0])
 const SLASH_COMMANDS = [
   { name: '/clear', desc: 'Удаляет чат и создаёт новый' },
   { name: '/compact', desc: 'Сжимает динамический контекст в короткую сводку' },
-  { name: '/create-promt', desc: 'Генерирует максимально качественный промпт и отдаёт его вам' },
   { name: '/create-prompt', desc: 'Генерирует максимально качественный промпт и отдаёт его вам' },
   { name: '/init', desc: 'Инициализирует MISTRAL.md в рабочей папке' }
 ];
@@ -101,6 +100,29 @@ function contentImages(c) {
   return c.filter((p) => p.type === 'image_url')
     .map((p) => (typeof p.image_url === 'string' ? p.image_url : p.image_url?.url))
     .filter(Boolean);
+}
+
+/**
+ * Map a stored message to what the API receives: UI-only metadata is dropped,
+ * and any attached-document text is folded into the content so the model sees
+ * it on every turn (the bubble itself only shows a file chip).
+ */
+function apiMessage(m) {
+  const content = stripReasonMeta(m.content);
+  if (!m.docs || !m.docs.length) return { role: m.role, content };
+  const blocks = m.docs.map((d) => `[Вложенный файл: ${d.name}]\n${d.text}`).join('\n\n');
+  if (Array.isArray(content)) {
+    return { role: m.role, content: [{ type: 'text', text: blocks }, ...content] };
+  }
+  const base = typeof content === 'string' ? content : '';
+  return { role: m.role, content: base ? `${base}\n\n${blocks}` : blocks };
+}
+
+/** Strip our render-only data-secs attribute so the model never sees (and then
+ *  imitates) it in its own reasoning blocks. */
+function stripReasonMeta(content) {
+  if (typeof content !== 'string') return content;
+  return content.replace(/<details\b[^>]*>/gi, '<details>');
 }
 
 /**
@@ -224,7 +246,7 @@ async function render(container, ctx) {
       <section class="thread-pane">
         <header class="thread-head">
           <span class="model mono" id="thModel">${escapeHtml(convo.model)}</span>
-          <span class="streaming hidden" id="thStreaming"><span class="pulse"></span>working</span>
+          <span class="streaming hidden" id="thStreaming"><span class="pulse"></span><span id="thStreamingTxt">working</span></span>
           <span class="spacer"></span>
           <button class="head-chip" id="folderBtn" title="Working folder">
             <svg viewBox="0 0 16 16"><path d="M2 4.5h4l1.5 1.5H14v6H2z"/></svg>
@@ -246,8 +268,8 @@ async function render(container, ctx) {
           <div class="composer-atts" id="atts" hidden></div>
           <textarea id="composer" placeholder="Message Mistral…  (Enter to send · Shift+Enter for newline)"></textarea>
           <div class="composer-bar">
-            <input type="file" id="fileInput" accept="image/*" multiple hidden />
-            <button class="icon-btn" id="attachBtn" title="Прикрепить изображение (до Full HD)">
+            <input type="file" id="fileInput" multiple hidden />
+            <button class="icon-btn" id="attachBtn" title="Прикрепить файл (изображение, PDF, документ, текст…)">
               <svg viewBox="0 0 16 16"><path d="M9.6 5.4 5.9 9a1.5 1.5 0 0 0 2.1 2.1l3.7-3.6a3 3 0 1 0-4.2-4.3L3.7 7.1a4.5 4.5 0 0 0 6.4 6.4l2.9-3"/></svg>
             </button>
             <span class="meta mono">↵ send</span>
@@ -296,20 +318,43 @@ async function render(container, ctx) {
   const fileInput = container.querySelector('#fileInput');
   const composerEl = container.querySelector('.composer');
   let pendingImages = []; // [{ id, dataUrl, name, w, h, tokens }]
+  let pendingDocs = [];   // [{ id, name, ext, text, chars, tokens, truncated }]
 
   function renderAtts() {
-    atts.hidden = pendingImages.length === 0;
-    atts.innerHTML = pendingImages.map((im) =>
+    atts.hidden = pendingImages.length === 0 && pendingDocs.length === 0;
+    const imgHtml = pendingImages.map((im) =>
       `<div class="att-thumb" title="${escapeHtml(im.name)} · ${im.w}×${im.h}">
          <img src="${im.dataUrl}" alt="" />
          <button class="att-del" data-id="${im.id}" title="Убрать">×</button>
        </div>`).join('');
-    atts.querySelectorAll('.att-del').forEach((b) =>
+    const docHtml = pendingDocs.map((d) =>
+      `<div class="att-doc" title="${escapeHtml(d.name)} · ${d.chars} симв.${d.truncated ? ' · обрезано' : ''}">
+         <span class="att-doc-ext">${escapeHtml((d.ext || 'file').toUpperCase())}</span>
+         <span class="att-doc-name">${escapeHtml(d.name)}</span>
+         <button class="att-del" data-doc="${d.id}" title="Убрать">×</button>
+       </div>`).join('');
+    atts.innerHTML = imgHtml + docHtml;
+    atts.querySelectorAll('.att-del[data-id]').forEach((b) =>
       b.addEventListener('click', () => {
         pendingImages = pendingImages.filter((x) => x.id !== b.dataset.id);
         renderAtts();
         updateTokens();
       }));
+    atts.querySelectorAll('.att-del[data-doc]').forEach((b) =>
+      b.addEventListener('click', () => {
+        pendingDocs = pendingDocs.filter((x) => x.id !== b.dataset.doc);
+        renderAtts();
+        updateTokens();
+      }));
+  }
+
+  // Route attachments: images keep the downscale-to-FHD path; everything else
+  // is sent to main for text extraction so only the extracted text enters context.
+  async function addFiles(fileList) {
+    const files = [...(fileList || [])];
+    if (!files.length) return;
+    await addImageFiles(files.filter(isImageFile));
+    for (const f of files.filter((f) => !isImageFile(f))) await addDocFile(f);
   }
 
   async function addImageFiles(fileList) {
@@ -328,8 +373,34 @@ async function render(container, ctx) {
     composer.focus();
   }
 
+  async function addDocFile(file) {
+    try {
+      const buf = await file.arrayBuffer();
+      const res = await api.docs.extract({ name: file.name, data: new Uint8Array(buf) });
+      if (!res?.ok) {
+        toast(`«${file.name}»: ${res?.error || 'не удалось прочитать файл'}`, 'error', 5000);
+        return;
+      }
+      if (!res.text || !res.text.trim()) {
+        toast(`В «${file.name}» не нашлось текста для извлечения`, 'info', 4000);
+        return;
+      }
+      const chars = res.chars || res.text.length;
+      pendingDocs.push({
+        id: uid(), name: file.name || 'file', ext: res.ext || '', text: res.text,
+        chars, tokens: Math.ceil(chars / 4), truncated: !!res.truncated
+      });
+      if (res.truncated) toast(`«${file.name}» большой — взял первую часть текста`, 'info', 4000);
+      renderAtts();
+      updateTokens();
+      composer.focus();
+    } catch (e) {
+      toast(`Ошибка чтения «${file.name}»`, 'error');
+    }
+  }
+
   container.querySelector('#attachBtn').addEventListener('click', () => fileInput.click());
-  fileInput.addEventListener('change', () => { addImageFiles(fileInput.files); fileInput.value = ''; });
+  fileInput.addEventListener('change', () => { addFiles(fileInput.files); fileInput.value = ''; });
   composer.addEventListener('paste', (e) => {
     const imgs = [...(e.clipboardData?.items || [])].filter((it) => it.type.startsWith('image/'));
     if (imgs.length) { e.preventDefault(); addImageFiles(imgs.map((it) => it.getAsFile()).filter(Boolean)); }
@@ -339,7 +410,7 @@ async function render(container, ctx) {
   composerEl.addEventListener('drop', (e) => {
     e.preventDefault();
     composerEl.classList.remove('dragover');
-    if (e.dataTransfer?.files?.length) addImageFiles(e.dataTransfer.files);
+    if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files);
   });
 
   let slashPopup = null;
@@ -426,10 +497,10 @@ async function render(container, ctx) {
         }
       } else {
         msgChars += contentText(m.content).length;
-        imgTokens += m.imageTokens || 0;
+        imgTokens += (m.imageTokens || 0) + (m.docTokens || 0);
       }
     }
-    imgTokens += pendingImages.reduce((s, i) => s + i.tokens, 0); // not sent yet, but about to be
+    imgTokens += pendingImages.reduce((s, i) => s + i.tokens, 0) + pendingDocs.reduce((s, d) => s + d.tokens, 0); // not sent yet, but about to be
     const tok = (c) => Math.ceil(c / 4);
     const system = ctxBaseline.system;
     const tools = ctxBaseline.tools;
@@ -466,10 +537,10 @@ async function render(container, ctx) {
         }
       } else {
         msgChars += contentText(m.content).length;
-        imgTokens += m.imageTokens || 0;
+        imgTokens += (m.imageTokens || 0) + (m.docTokens || 0);
       }
     }
-    imgTokens += pendingImages.reduce((s, i) => s + i.tokens, 0);
+    imgTokens += pendingImages.reduce((s, i) => s + i.tokens, 0) + pendingDocs.reduce((s, d) => s + d.tokens, 0);
     const tok = (c) => Math.ceil(c / 4);
     const system = ctxBaseline.system;
     const tools = ctxBaseline.tools;
@@ -513,6 +584,19 @@ async function render(container, ctx) {
     }
     rateMeta.textContent = text;
     rateMeta.title = text ? `Rate Limit: ${remaining}/${limit} requests remaining, resets in ${Math.ceil((resetAt - Date.now()) / 1000)}s` : '';
+  };
+
+  // Rate limited — surface the wait (toast + streaming pill) without rolling
+  // anything back; the request is retried automatically in the background.
+  const setStreamLabel = (txt) => {
+    const el = container.querySelector('#thStreamingTxt');
+    if (el && el.textContent !== txt) el.textContent = txt;
+  };
+  const noteRateLimitWait = (msg) => {
+    const secs = Math.max(1, Math.round((msg.waitMs || 0) / 1000));
+    setStreamLabel(`лимит · повтор через ${secs}s`);
+    toast(`Достигнут лимит запросов. Жду ${secs} с и продолжаю… (попытка ${msg.attempt}/${msg.maxRetries})`,
+      'info', Math.min(6000, Math.max(2500, msg.waitMs || 3000)));
   };
 
   // System prompt + tool schemas are fixed parts of the window; fetch their
@@ -626,9 +710,10 @@ async function render(container, ctx) {
   async function send(opts = {}) {
     const text = composer.value.trim();
     const imgs = pendingImages.slice();
-    if ((!text && !imgs.length) || streaming) return;
+    const docs = pendingDocs.slice();
+    if ((!text && !imgs.length && !docs.length) || streaming) return;
 
-    if (text.startsWith('/') && !imgs.length) {
+    if (text.startsWith('/') && !imgs.length && !docs.length) {
       const handled = await handleSlashCommand(text);
       if (handled) {
         closeSlashSuggestions();
@@ -660,9 +745,17 @@ async function render(container, ctx) {
     }
     const userMsg = { role: 'user', content: userContent };
     if (imgs.length) userMsg.imageTokens = imgs.reduce((s, i) => s + i.tokens, 0);
+    // Attached documents: keep the extracted text as message metadata (shown as
+    // a file chip, folded into the outgoing content at send time) so the model
+    // sees the text on every turn while the chat bubble stays clean.
+    if (docs.length) {
+      userMsg.docs = docs.map((d) => ({ name: d.name, ext: d.ext, text: d.text, chars: d.chars }));
+      userMsg.docTokens = docs.reduce((s, d) => s + d.tokens, 0);
+    }
     convo.messages.push(userMsg);
 
     pendingImages = [];
+    pendingDocs = [];
     renderAtts();
     composer.value = '';
     composer.style.height = 'auto';
@@ -676,8 +769,9 @@ async function render(container, ctx) {
     const outgoing = [];
     if (preset?.content?.trim()) outgoing.push({ role: 'system', content: preset.content });
     // Send only what the API understands — strip UI-only metadata (skillUsed,
-    // toolChars, imageTokens). content may be a string or a vision parts array.
-    outgoing.push(...convo.messages.map((m) => ({ role: m.role, content: m.content })));
+    // toolChars, imageTokens). content may be a string or a vision parts array;
+    // attached-document text is folded into the content here.
+    outgoing.push(...convo.messages.map(apiMessage));
 
     // Assistant placeholder. The agent loop streams multiple turns into this
     // one message: `committed` holds finalised visible text + tool lines from
@@ -695,6 +789,8 @@ async function render(container, ctx) {
     let rawTurn = '';
     let rafPending = false;
     let outputTokens = 0; // real-time token count of the streamed output
+    let reasonStart = 0;  // wall-clock when the current turn's reasoning opened
+    let reasonSecs = 0;   // measured reasoning duration (0 until the block closes)
 
     // Local contextBreakdown for this send() closure to access outputTokens
     const contextBreakdown = () => {
@@ -711,10 +807,10 @@ async function render(container, ctx) {
           }
         } else {
           msgChars += contentText(m.content).length;
-          imgTokens += m.imageTokens || 0;
+          imgTokens += (m.imageTokens || 0) + (m.docTokens || 0);
         }
       }
-      imgTokens += pendingImages.reduce((s, i) => s + i.tokens, 0); // not sent yet, but about to be
+      imgTokens += pendingImages.reduce((s, i) => s + i.tokens, 0) + pendingDocs.reduce((s, d) => s + d.tokens, 0); // not sent yet, but about to be
       const tok = (c) => Math.ceil(c / 4);
       const system = ctxBaseline.system;
       const tools = ctxBaseline.tools;
@@ -744,23 +840,38 @@ async function render(container, ctx) {
     const flush = () => {
       rafPending = false;
       asstMsg.content = committed + rawTurn; // renderMarkdown strips action tags
-      if (live) { const { head, typed } = splitTurn(rawTurn); live.update(committed, head, typed); }
+      if (live) { const { head, typed } = splitTurn(rawTurn, reasonSecs); live.update(committed, head, typed); }
       else { updateLastAssistant(thread, asstMsg.content, true); if (autoScroll) forceScroll(thread); }
       updateTokens(); // keep the context gauge live as tokens stream in
     };
     const scheduleFlush = () => { if (!rafPending) { rafPending = true; requestAnimationFrame(flush); } };
 
     // Commit the current turn's visible text before tool lines are appended.
+    // Bake the measured reasoning duration into the block so "Думал N сек"
+    // survives re-render and history reload.
     const commitTurn = () => {
-      const visible = stripAgentTags(rawTurn).replace(/\s+$/, '');
+      let visible = stripAgentTags(rawTurn).replace(/\s+$/, '');
+      if (visible && reasonSecs) {
+        // Normalize the opening tag (whatever attributes the model emitted) to
+        // carry exactly our measured duration.
+        visible = visible.replace(/<details\b[^>]*>/i, `<details data-secs="${reasonSecs}">`);
+      }
       if (visible) committed += (committed ? '\n\n' : '') + visible;
       rawTurn = '';
+      reasonStart = 0; reasonSecs = 0; // reset for the next turn's reasoning
     };
 
     unsubStream = api.mistral.onStream((msg) => {
       if (msg.type === 'token') {
         rawTurn += msg.delta;
+        setStreamLabel('working'); // tokens flowing again → clear any "wait" label
         outputTokens += estimateTokens(msg.delta);
+        // Time the reasoning block: it opens at the first <details> and the
+        // duration is fixed the moment </details> arrives.
+        if (!reasonStart && /<details>/i.test(rawTurn)) reasonStart = Date.now();
+        if (reasonStart && !reasonSecs && /<\/details>/i.test(rawTurn)) {
+          reasonSecs = Math.max(1, Math.round((Date.now() - reasonStart) / 1000));
+        }
         updateTokens(); // update gauge immediately on each token
         scheduleFlush();
       } else if (msg.type === 'turn') {
@@ -790,6 +901,10 @@ async function render(container, ctx) {
       } else if (msg.type === 'rate-limit') {
         lastRateLimit = msg.rateLimit;
         displayRateLimit();
+      } else if (msg.type === 'rate-limit-wait') {
+        // Hit the API rate limit — we wait and retry instead of rolling back.
+        if (msg.rateLimit) { lastRateLimit = msg.rateLimit; displayRateLimit(); }
+        noteRateLimitWait(msg);
       } else if (msg.type === 'subagent-start') {
         committed += `\n\n> \`субагент\` ▸ ${escapeHtml(msg.task || '')}${msg.mode === 'read' ? ' · только чтение' : ''}`;
         scheduleFlush();
@@ -978,7 +1093,11 @@ function paintThread(thread, streamingLast = false) {
       const imgsHtml = uimgs.length
         ? `<div class="bubble-imgs">${uimgs.map((u) => `<img class="bubble-img" src="${u}" alt="" />`).join('')}</div>`
         : '';
-      return `<div class="msg-row user"><div class="bubble user">${imgsHtml}${utext ? escapeHtml(utext) : ''}</div></div>`;
+      const docsHtml = (m.docs && m.docs.length)
+        ? `<div class="bubble-docs">${m.docs.map((d) =>
+            `<span class="bubble-doc"><span class="bubble-doc-ext">${escapeHtml((d.ext || 'file').toUpperCase())}</span>${escapeHtml(d.name)}</span>`).join('')}</div>`
+        : '';
+      return `<div class="msg-row user"><div class="bubble user">${imgsHtml}${docsHtml}${utext ? escapeHtml(utext) : ''}</div></div>`;
     }
     const isLast = i === convo.messages.length - 1;
     const cursor = streamingLast && isLast ? '<span class="stream-cursor">▏</span>' : '';
@@ -1010,21 +1129,26 @@ function updateLastAssistant(thread, text, withCursor) {
  * — open while it's still streaming, collapsed once the answer begins — and
  * only typewrite the answer that follows.
  */
-function splitTurn(raw) {
+function splitTurn(raw, reasonSecs = 0) {
   const t = stripAgentTags(raw);
-  const i = t.search(/<details>/i);
-  if (i === -1) return { head: '', typed: t };
+  // Match the opening tag with ANY attributes (open, data-secs, …) so the
+  // reasoning block is never mistaken for answer text and leaked as raw markup.
+  const open = /<details\b[^>]*>/i.exec(t);
+  if (!open) return { head: '', typed: t };
+  const i = open.index;
   const before = t.slice(0, i);
-  const rest = t.slice(i + '<details>'.length);
+  const rest = t.slice(i + open[0].length);
   const end = rest.search(/<\/details>/i);
   if (end === -1) {
-    // Reasoning still streaming → show it open, nothing to type yet.
+    // Reasoning still streaming → show it open ("Думает"), nothing to type yet.
     return { head: renderMarkdown('<details open>' + rest + '</details>'), typed: before };
   }
   const inner = rest.slice(0, end);
   const after = rest.slice(end + '</details>'.length);
+  // Reasoning finished → closed block carries its measured duration.
+  const tag = reasonSecs ? `<details data-secs="${reasonSecs}">` : '<details>';
   return {
-    head: renderMarkdown('<details>' + inner + '</details>'),
+    head: renderMarkdown(tag + inner + '</details>'),
     typed: (before + after).replace(/^\s+/, '')
   };
 }
@@ -1195,7 +1319,9 @@ async function openSession(session, repaint = true) {
       content: m.content,
       ...(m.skillUsed ? { skillUsed: m.skillUsed } : {}),
       ...(m.toolChars ? { toolChars: m.toolChars } : {}),
-      ...(m.imageTokens ? { imageTokens: m.imageTokens } : {})
+      ...(m.imageTokens ? { imageTokens: m.imageTokens } : {}),
+      ...(m.docs ? { docs: m.docs } : {}),
+      ...(m.docTokens ? { docTokens: m.docTokens } : {})
     })),
     workingDir: session.workingDir || '',
     todos: session.todos || []
