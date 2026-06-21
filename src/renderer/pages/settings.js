@@ -11,6 +11,7 @@ const SECTIONS = [
   ['output', 'Output'],
   ['memory', 'Memory'],
   ['skills', 'Skills'],
+  ['plugins', 'Plugins'],
   ['interface', 'Interface'],
   ['shortcuts', 'Shortcuts']
 ];
@@ -26,6 +27,7 @@ const SHORTCUTS = [
 ];
 
 let activeSection = 'api';
+let pluginsUnsub = null; // unsubscribe fn for the live plugin-event stream
 
 async function render(container) {
   const settings = await getSettings();
@@ -55,9 +57,11 @@ async function render(container) {
 }
 
 function drawSection(pane, settings) {
+  // Tear down the live plugin-event subscription when leaving / re-rendering.
+  if (pluginsUnsub) { pluginsUnsub(); pluginsUnsub = null; }
   ({
     api: drawApi, model: drawModel, output: drawOutput, memory: drawMemory,
-    skills: drawSkills, interface: drawInterface, shortcuts: drawShortcuts
+    skills: drawSkills, plugins: drawPlugins, interface: drawInterface, shortcuts: drawShortcuts
   }[activeSection])(pane, settings);
 }
 
@@ -391,6 +395,122 @@ async function drawSkills(pane, settings) {
     });
     toast(`Скилл /${r.name} создан`, 'success', 2000);
     drawSkills(pane, settings);
+  });
+}
+
+/* ---------------- Plugins section ---------------- */
+const PLUGIN_STATUS = (p) => p.error ? '🔴 ошибка' : p.running ? '🟢 запущен' : '⚪ остановлен';
+
+async function drawPlugins(pane, settings) {
+  // Drop any previous subscription — drawPlugins can re-enter directly (toggle /
+  // refresh) without going through drawSection, so clean up here too.
+  if (pluginsUnsub) { pluginsUnsub(); pluginsUnsub = null; }
+  const locale = settings.locale || 'ru';
+  let items = [];
+  try { items = await api.plugins.list(); } catch { items = []; }
+
+  const cards = items.length ? items.map((p) => {
+    const fields = (p.settings || []).map((f) => {
+      const val = (p.config && p.config[f.key] != null) ? p.config[f.key] : '';
+      const type = f.type === 'password' ? 'password' : 'text';
+      return `
+        <div class="setrow">
+          <div class="setlbl"><div class="l1">${escapeHtml(f.label || f.key)}</div>${f.hint ? `<div class="l2">${escapeHtml(f.hint)}</div>` : ''}</div>
+          <div class="setctl" style="max-width:340px">
+            <input class="field-box plg-field" data-key="${escapeHtml(f.key)}" type="${type}"
+                   value="${escapeHtml(String(val))}" placeholder="${escapeHtml(f.placeholder || '')}" style="width:100%" />
+          </div>
+        </div>`;
+    }).join('');
+
+    return `
+      <div class="set-section plg-card" data-id="${escapeHtml(p.id)}" style="border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:18px">
+        <div class="setrow" style="border:none">
+          <div class="setlbl">
+            <div class="l1">${escapeHtml(p.name)}
+              <span class="meta mono plg-status" style="font-size:10.5px;color:var(--ink-3);margin-left:8px">${PLUGIN_STATUS(p)}</span>
+            </div>
+            <div class="l2">${escapeHtml(p.description || '')}</div>
+          </div>
+          <div class="setctl" style="display:flex;align-items:center;gap:10px;justify-content:flex-end">
+            <button class="btn ${p.running ? 'ghost danger' : 'primary'} sm plg-toggle" data-running="${p.running ? '1' : ''}">${p.running ? 'Стоп' : 'Старт'}</button>
+          </div>
+        </div>
+        ${fields}
+        <div style="display:flex;gap:10px;margin-top:10px">
+          <button class="btn primary sm plg-save">Сохранить настройки</button>
+        </div>
+        <pre class="plg-log mono" style="margin-top:14px;max-height:170px;overflow:auto;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:10px;font-size:11px;line-height:1.6;white-space:pre-wrap;color:var(--ink-2)"></pre>
+      </div>`;
+  }).join('')
+    : '<div class="set-sub">Плагины не найдены. Положите папку с plugin.json и index.js в пользовательскую папку плагинов.</div>';
+
+  pane.innerHTML = `
+    <div class="set-section">
+      <div class="set-h">${t('Plugins', locale)}</div>
+      <div class="set-sub">Фоновые интеграции, работающие через тот же движок, что и чат. Каждый плагин — отдельная папка со скриптами.</div>
+      ${cards}
+      <div style="display:flex;gap:10px;margin-top:6px">
+        <button class="btn ghost sm" id="plgOpen">Открыть папку плагинов</button>
+        <button class="btn ghost sm" id="plgRefresh">Обновить</button>
+      </div>
+    </div>`;
+
+  pane.querySelector('#plgOpen').addEventListener('click', () => api.plugins.openDir());
+  pane.querySelector('#plgRefresh').addEventListener('click', () => drawPlugins(pane, settings));
+
+  pane.querySelectorAll('.plg-card').forEach((card) => {
+    const id = card.dataset.id;
+    const logEl = card.querySelector('.plg-log');
+    const statusEl = card.querySelector('.plg-status');
+
+    const collectConfig = () => {
+      const cfg = {};
+      card.querySelectorAll('.plg-field').forEach((inp) => { cfg[inp.dataset.key] = inp.value; });
+      return cfg;
+    };
+
+    card.querySelector('.plg-save').addEventListener('click', async () => {
+      await api.plugins.setConfig(id, collectConfig());
+      toast('Настройки сохранены', 'success', 1600);
+      // Pick up the new config on the next run.
+      const running = card.querySelector('.plg-toggle').dataset.running === '1';
+      if (running) { await api.plugins.stop(id); await api.plugins.start(id); }
+    });
+
+    card.querySelector('.plg-toggle').addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      const running = btn.dataset.running === '1';
+      btn.disabled = true;
+      if (running) {
+        await api.plugins.stop(id);
+      } else {
+        await api.plugins.setConfig(id, collectConfig()); // save first, then start
+        const r = await api.plugins.start(id);
+        if (!r || !r.ok) toast(`Не удалось запустить: ${(r && r.error) || 'ошибка'}`, 'error');
+      }
+      drawPlugins(pane, settings); // re-render to reflect the new state
+    });
+
+    // Tag elements so the shared event stream can route to the right card.
+    logEl.dataset.id = id;
+    statusEl.dataset.id = id;
+  });
+
+  // Single live subscription for the whole section; route events by plugin id.
+  pluginsUnsub = api.plugins.onEvent((ev) => {
+    const card = pane.querySelector(`.plg-card[data-id="${ev.id}"]`);
+    if (!card) return;
+    if (ev.type === 'log') {
+      const logEl = card.querySelector('.plg-log');
+      const time = new Date(ev.at || Date.now()).toLocaleTimeString();
+      logEl.textContent += `${time}  ${ev.line}\n`;
+      if (logEl.textContent.length > 8000) logEl.textContent = logEl.textContent.slice(-8000);
+      logEl.scrollTop = logEl.scrollHeight;
+    } else if (ev.type === 'status') {
+      const statusEl = card.querySelector('.plg-status');
+      statusEl.textContent = ev.error ? '🔴 ошибка' : ev.running ? '🟢 запущен' : '⚪ остановлен';
+    }
   });
 }
 

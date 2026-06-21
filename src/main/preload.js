@@ -78,6 +78,22 @@ contextBridge.exposeInMainWorld('api', {
     openDir: () => ipcRenderer.invoke('skills:openDir')
   },
 
+  /* ---- plugins (background integrations, e.g. Telegram bot) ---- */
+  plugins: {
+    list: () => ipcRenderer.invoke('plugins:list'),
+    start: (id) => ipcRenderer.invoke('plugins:start', id),
+    stop: (id) => ipcRenderer.invoke('plugins:stop', id),
+    getConfig: (id) => ipcRenderer.invoke('plugins:getConfig', id),
+    setConfig: (id, config) => ipcRenderer.invoke('plugins:setConfig', id, config),
+    openDir: () => ipcRenderer.invoke('plugins:openDir'),
+    // Live log/status events; returns an unsubscribe fn.
+    onEvent: (cb) => {
+      const handler = (_e, ev) => cb(ev);
+      ipcRenderer.on('plugins:event', handler);
+      return () => ipcRenderer.removeListener('plugins:event', handler);
+    }
+  },
+
   /* ---- attachment text extraction (docs/binaries dropped in the composer) ---- */
   docs: {
     extract: (payload) => ipcRenderer.invoke('docs:extract', payload)

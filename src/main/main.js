@@ -9,6 +9,7 @@ const agent = require('./agent');
 const tools = require('./tools');
 const skills = require('./skills');
 const extract = require('./extract');
+const plugins = require('./plugins');
 const { createConsoleManager } = require('./consoles');
 
 const isDev = process.argv.includes('--dev');
@@ -369,6 +370,57 @@ function getApiKey() {
 }
 
 /* ------------------------------------------------------------------ *
+ *  Plugins
+ *  Background integrations (e.g. the Telegram bot) that drive the SAME
+ *  agent engine the in-app chat uses. `runPluginAgent` is the bridge: it
+ *  mirrors the `mistral:send` handler but is parameterised by the plugin
+ *  (its own messages, permission mode, approval callback and abort signal),
+ *  and returns the final answer instead of streaming to the renderer.
+ * ------------------------------------------------------------------ */
+async function runPluginAgent({ messages, permissionMode, requestApproval, onEvent, signal }) {
+  const apiKey = getApiKey();
+  if (!apiKey) return { ok: false, error: 'API-ключ Mistral не задан в настройках приложения.' };
+  // The folder is shared with the in-app chat; require it up-front so a
+  // file/shell action never pops a desktop folder dialog from a remote trigger.
+  if (!store.get('workingDir')) return { ok: false, error: 'no-workdir' };
+
+  const settings = { ...store.get('settings'), aiPermissionMode: permissionMode || 'default' };
+  const baseMessages = [{ role: 'system', content: buildAgentSystem(settings) }, ...messages];
+  const consoles = createConsoleManager();
+  let finalContent = '';
+  let errored = null;
+  const emit = (msg) => {
+    if (msg.type === 'done') finalContent = msg.content || '';
+    if (msg.type === 'error') errored = msg.message;
+    try { onEvent?.(msg); } catch { /* plugin sink errors are not fatal */ }
+  };
+  const ctx = {
+    store, getWindow: () => mainWindow, appendMemory, signal, consoles,
+    settings, apiKey, emit, subagentDepth: 0
+  };
+  try {
+    await agent.run({ baseMessages, settings, apiKey, signal, emit, requestApproval, ctx });
+    if (errored) return { ok: false, error: errored };
+    return { ok: true, content: finalContent };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  } finally {
+    consoles.closeAll();
+  }
+}
+
+const pluginManager = plugins.createManager({
+  store,
+  userDataDir: app.getPath('userData'),
+  runAgent: runPluginAgent,
+  getWindow: () => mainWindow
+});
+// Forward plugin log/status events to the renderer (Settings → Plugins).
+pluginManager.on((ev) => {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('plugins:event', ev);
+});
+
+/* ------------------------------------------------------------------ *
  *  IPC: persistent store
  * ------------------------------------------------------------------ */
 ipcMain.handle('store:get', (_e, key) => store.get(key));
@@ -415,6 +467,19 @@ ipcMain.handle('skills:delete', (_e, name) => skills.deleteSkill(name));
 ipcMain.handle('skills:dir', () => skills.ensureUserDir());
 ipcMain.handle('skills:openDir', async () => {
   const dir = skills.ensureUserDir();
+  await shell.openPath(dir);
+  return dir;
+});
+
+// Plugins (background integrations). State/config live in the store; running
+// instances live in the manager. Log/status events are pushed on 'plugins:event'.
+ipcMain.handle('plugins:list', () => pluginManager.list());
+ipcMain.handle('plugins:start', (_e, id) => pluginManager.start(id));
+ipcMain.handle('plugins:stop', (_e, id) => pluginManager.stop(id));
+ipcMain.handle('plugins:getConfig', (_e, id) => pluginManager.getConfig(id));
+ipcMain.handle('plugins:setConfig', (_e, id, config) => { pluginManager.setConfig(id, config); return true; });
+ipcMain.handle('plugins:openDir', async () => {
+  const dir = pluginManager.openDir();
   await shell.openPath(dir);
   return dir;
 });
@@ -641,6 +706,7 @@ function sessionToMarkdown(session) {
  * ------------------------------------------------------------------ */
 app.whenReady().then(() => {
   createWindow();
+  pluginManager.initAutostart(); // bring back up any plugin the user had enabled
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

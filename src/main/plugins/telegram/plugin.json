@@ -1,0 +1,10 @@
+{
+  "id": "telegram",
+  "name": "Telegram Plugin",
+  "version": "1.0.0",
+  "description": "Управляй компьютером через Telegram-бота: пиши задачи в чат — ассистент выполняет их на этом ПК и отвечает в Telegram.",
+  "settings": [
+    { "key": "botToken", "label": "Bot Token", "type": "password", "placeholder": "123456:ABC-DEF…", "hint": "Токен от @BotFather" },
+    { "key": "password", "label": "Пароль доступа", "type": "password", "placeholder": "задайте пароль для входа в бот", "hint": "Бот ответит только после ввода этого пароля в Telegram" }
+  ]
+}
