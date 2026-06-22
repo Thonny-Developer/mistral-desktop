@@ -138,6 +138,7 @@ async function render(container, ctx) {
     if (i >= 0) sessions.splice(i, 1);
     selected.delete(id);
     await store.set('sessions', sessions);
+    document.dispatchEvent(new Event('sessions-changed'));
     toast('Session deleted', 'info', 2000);
     draw();
   };
@@ -160,6 +161,7 @@ async function render(container, ctx) {
     sessions.length = 0; sessions.push(...remaining);
     selected.clear();
     await store.set('sessions', sessions);
+    document.dispatchEvent(new Event('sessions-changed'));
     toast('Sessions deleted', 'info', 2000);
     draw();
   });
@@ -175,6 +177,7 @@ async function render(container, ctx) {
     sessions.length = 0;
     selected.clear();
     await store.set('sessions', sessions);
+    document.dispatchEvent(new Event('sessions-changed'));
     toast('All chats deleted', 'info', 2000);
     draw();
   });

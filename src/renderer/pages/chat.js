@@ -599,6 +599,85 @@ async function render(container, ctx) {
       'info', Math.min(6000, Math.max(2500, msg.waitMs || 3000)));
   };
 
+  // --- Local model loading indicator ---------------------------------------
+  // A local server (LM Studio) loads the model into memory on first use, so the
+  // first reply can take a while with nothing on screen. The main process
+  // reports `model-loading` stages (see mistral.js) and we render a staged
+  // panel inside the pending assistant bubble so the wait is legible.
+  let loadingTimer = null;
+  const LOAD_STAGES = [
+    { k: 'connect', label: 'Подключение к локальному серверу' },
+    { k: 'load', label: 'Загрузка модели в память' },
+    { k: 'warm', label: 'Обработка запроса' }
+  ];
+  function showModelLoading(msg) {
+    const slot = container.querySelector('.asst-row:last-child .msg-content');
+    if (!slot) return;
+    let el = slot.querySelector('#modelLoading');
+    // Full staged panel only while the model is actually initialising into
+    // memory (`loading`). If the model is already resident and we're merely
+    // waiting on prompt processing (`warming`) with no prior load shown, use a
+    // compact one-line spinner instead.
+    const compact = !el && msg.stage === 'warming';
+    if (!el) {
+      slot.classList.add('is-loading');
+      el = document.createElement('div');
+      el.className = compact ? 'model-loading compact' : 'model-loading';
+      el.id = 'modelLoading';
+      el.innerHTML = compact
+        ? `
+        <div class="ml-head">
+          <span class="ml-spin"></span>
+          <span class="ml-title">Обработка запроса</span>
+          <span class="ml-elapsed" id="mlElapsed">0&nbsp;с</span>
+        </div>`
+        : `
+        <div class="ml-head">
+          <span class="ml-spin"></span>
+          <span class="ml-title">Подготовка модели</span>
+          <span class="ml-elapsed" id="mlElapsed">0&nbsp;с</span>
+        </div>
+        <ul class="ml-stages">
+          ${LOAD_STAGES.map((s) => `<li class="ml-stage" data-k="${s.k}"><span class="ml-dot"></span><span>${s.label}</span></li>`).join('')}
+        </ul>
+        <div class="ml-hint" id="mlHint"></div>`;
+      slot.prepend(el);
+    }
+    // 'warming' = model resident, prompt processing (stage 3); else loading (2).
+    if (!el.classList.contains('compact')) {
+      const activeIdx = msg.stage === 'warming' ? 2 : 1;
+      el.querySelectorAll('.ml-stage').forEach((li, i) => {
+        li.classList.toggle('done', i < activeIdx);
+        li.classList.toggle('active', i === activeIdx);
+      });
+    }
+    setStreamLabel(msg.stage === 'warming' ? 'почти готово…' : 'загрузка модели…');
+    el.dataset.startedAt = String(msg.startedAt || Date.now());
+    if (!loadingTimer) {
+      const tick = () => {
+        const node = container.querySelector('#mlElapsed');
+        if (!node) { hideModelLoading(); return; } // bubble gone → stop ticking
+        const secs = Math.max(0, Math.round((Date.now() - Number(el.dataset.startedAt)) / 1000));
+        node.innerHTML = `${secs}&nbsp;с`;
+        const hint = container.querySelector('#mlHint');
+        if (hint) hint.textContent = secs >= 10
+          ? 'Крупная модель грузится дольше — идёт чтение весов с диска.'
+          : '';
+      };
+      tick();
+      loadingTimer = setInterval(tick, 1000);
+    }
+  }
+  function hideModelLoading() {
+    if (loadingTimer) { clearInterval(loadingTimer); loadingTimer = null; }
+    const el = container.querySelector('#modelLoading');
+    if (el) {
+      const slot = el.closest('.msg-content');
+      el.remove();
+      slot?.classList.remove('is-loading');
+    }
+  }
+
   // System prompt + tool schemas are fixed parts of the window; fetch their
   // sizes from main and refresh the gauge.
   async function refreshCtxBaseline() {
@@ -862,6 +941,10 @@ async function render(container, ctx) {
     };
 
     unsubStream = api.mistral.onStream((msg) => {
+      // Local model load progress — render it and wait for real output.
+      if (msg.type === 'model-loading') { showModelLoading(msg); return; }
+      // Anything else means output (or an end state) has begun → drop the loader.
+      if (loadingTimer) hideModelLoading();
       if (msg.type === 'token') {
         rawTurn += msg.delta;
         setStreamLabel('working'); // tokens flowing again → clear any "wait" label
@@ -996,6 +1079,7 @@ async function render(container, ctx) {
 
   function cleanupStream() {
     streaming = false;
+    hideModelLoading(); // clear any loader left if the turn ended without output
     removeApprovalCard();
     if (unsubStream) { unsubStream(); unsubStream = null; }
     reflectStreamingUI();

@@ -373,9 +373,11 @@ async function boot() {
 
   await showFirstRunDialog();
 
-  // Warn (once) if no API key is configured yet.
+  // Warn (once) if no API key is configured yet — but not for LM Studio, which
+  // runs locally without one.
+  const bootSettings = await getSettings();
   const hasKey = await api.apiKey.has();
-  if (!hasKey) {
+  if (!hasKey && (bootSettings.provider || 'mistral') !== 'lmstudio') {
     setTimeout(() => toast(t('No API key set — open Settings to connect to Mistral.', locale), 'info', 6000), 600);
   }
 

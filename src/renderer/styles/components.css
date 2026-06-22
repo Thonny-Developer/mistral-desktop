@@ -164,6 +164,52 @@ select.field-box { appearance: none; cursor: pointer; background-image: none; }
 .streaming.err .pulse { background: var(--danger); animation: none; }
 @keyframes pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
 
+/* Local model loading panel (LM Studio JIT load) ------------------------- */
+.model-loading {
+  margin: 2px 0 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 5%, var(--panel-2));
+  max-width: 420px;
+}
+.msg-content.is-loading .stream-cursor { display: none; }
+.ml-head { display: flex; align-items: center; gap: 9px; }
+.ml-spin {
+  width: 13px; height: 13px; flex: none; border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  border-top-color: var(--accent);
+  animation: ml-spin .7s linear infinite;
+}
+@keyframes ml-spin { to { transform: rotate(360deg); } }
+.ml-title { font-size: 12.5px; font-weight: 600; color: var(--ink); }
+.ml-elapsed { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+.ml-stages { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.ml-stage {
+  display: flex; align-items: center; gap: 9px;
+  font-size: 11.5px; color: var(--ink-3);
+  transition: color .2s;
+}
+.ml-stage .ml-dot {
+  width: 7px; height: 7px; flex: none; border-radius: 50%;
+  border: 1px solid var(--ink-4); background: transparent;
+  transition: background .2s, border-color .2s;
+}
+.ml-stage.active { color: var(--ink); }
+.ml-stage.active .ml-dot { border-color: var(--accent); background: var(--accent); animation: pulse 1.1s infinite; }
+.ml-stage.done { color: var(--ink-2); }
+.ml-stage.done .ml-dot { border-color: var(--ok); background: var(--ok); animation: none; }
+.ml-hint { margin-top: 9px; font-size: 10.5px; line-height: 1.4; color: var(--ink-3); }
+.ml-hint:empty { display: none; }
+/* Compact loader — model already resident, only prompt processing remains. */
+.model-loading.compact {
+  margin: 2px 0 6px;
+  padding: 0;
+  border: none;
+  background: none;
+}
+.model-loading.compact .ml-title { font-weight: 500; color: var(--ink-2); }
+
 /* generic box */
 .box { border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); }
 .box-2 { background: var(--panel-2); }

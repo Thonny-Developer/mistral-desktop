@@ -32,6 +32,39 @@ const SUPPORTED_MODELS = [
 /** Fallback model when settings don't specify one. */
 const DEFAULT_MODEL = 'codestral-latest';
 
+/** LM Studio's default local OpenAI-compatible server endpoint. */
+const LMSTUDIO_ENDPOINT = 'http://localhost:1234/v1';
+
+/**
+ * Resolve the active provider's connection config from settings.
+ *
+ * LM Studio exposes a local OpenAI-compatible API, so the same request/SSE code
+ * works against it — it just needs no API key and has its own endpoint, kept
+ * separate (`lmstudioEndpoint`) so switching providers never clobbers the
+ * Mistral endpoint.
+ */
+function providerConfig(settings) {
+  if (settings && settings.provider === 'lmstudio') {
+    return {
+      provider: 'lmstudio',
+      endpoint: settings.lmstudioEndpoint || LMSTUDIO_ENDPOINT,
+      requiresKey: false
+    };
+  }
+  return {
+    provider: 'mistral',
+    endpoint: (settings && settings.endpoint) || DEFAULT_ENDPOINT,
+    requiresKey: true
+  };
+}
+
+/** Build request headers, attaching auth only when a key is actually present. */
+function authHeaders(apiKey, extra) {
+  const h = { ...(extra || {}) };
+  if (apiKey) h.Authorization = `Bearer ${apiKey}`;
+  return h;
+}
+
 /**
  * Normalise a message/delta `content` into plain text.
  *
@@ -184,6 +217,45 @@ function abortableDelay(ms, signal) {
 
 const MAX_RATE_LIMIT_RETRIES = 5;
 
+/**
+ * Staged loading reporter for local models.
+ *
+ * A local server (LM Studio) loads the model into memory on first use ("JIT
+ * loading"): the request to `/chat/completions` blocks until the model is
+ * resident, then streams. There's no progress channel over the OpenAI-compatible
+ * API, so we surface where we are by timing the request instead:
+ *
+ *   • `loading` — fired only if waiting on the response headers exceeds a short
+ *      threshold (the model is being read into RAM/VRAM).
+ *   • `warming` — the server answered; the model is resident and now processing
+ *      the prompt / producing the first token.
+ *
+ * Because the first event is deferred behind a threshold, a fast turn (model
+ * already loaded) reports nothing — no loader ever flashes. Disabled entirely
+ * for the cloud provider, which has no such load step.
+ *
+ * @param {Function} onLoading  called with `{ stage, startedAt }`.
+ * @param {boolean}  enabled    only true for the local provider.
+ */
+function createLoadWatch(onLoading, enabled) {
+  if (!enabled || typeof onLoading !== 'function') {
+    return { ready() {}, stop() {} };
+  }
+  const startedAt = Date.now();
+  let timer = null;
+  let shown = false;
+  const fire = (stage) => { shown = true; onLoading({ stage, startedAt }); };
+  const arm = (stage, delay) => { clearTimeout(timer); timer = setTimeout(() => fire(stage), delay); };
+  arm('loading', 500); // only surfaces when the load actually takes a moment
+  return {
+    // Headers arrived → model resident, prompt being processed. Advance to
+    // "warming" immediately if we already showed "loading", else keep the
+    // threshold so a quick turn still shows nothing.
+    ready() { arm('warming', shown ? 0 : 600); },
+    stop() { clearTimeout(timer); timer = null; }
+  };
+}
+
 /** Extract rate limit information from response headers. */
 function extractRateLimitInfo(headers) {
   if (!headers) return null;
@@ -212,10 +284,12 @@ function extractRateLimitInfo(headers) {
  * @param {Array}    opts.tools          Optional tool/function schemas for native tool-calling.
  * @returns {Promise<{content:string, toolCalls:Array, usage:Object|null}>}
  */
-async function sendMessage({ messages, settings, apiKey, onToken, signal, tools, onRetry }) {
-  if (!apiKey) throw apiError('No API key configured. Add one in Settings.', 'auth');
+async function sendMessage({ messages, settings, apiKey, onToken, signal, tools, onRetry, onLoading }) {
+  const prov = providerConfig(settings);
+  if (prov.requiresKey && !apiKey) throw apiError('No API key configured. Add one in Settings.', 'auth');
 
-  const endpoint = settings.endpoint || DEFAULT_ENDPOINT;
+  const isLocal = prov.provider === 'lmstudio'; // only the local server has a load step
+  const endpoint = prov.endpoint;
   const stream = settings.stream !== false;
   const qualityMode = settings.reasoningLevel || 'medium';
   const QUALITY_SAMPLING = {
@@ -257,24 +331,27 @@ async function sendMessage({ messages, settings, apiKey, onToken, signal, tools,
   // instead of being rolled back. Nothing has streamed yet at this point (the
   // error is raised before the body is read), so a retry is clean.
   for (let attempt = 0; ; attempt++) {
+    // Report the local-model load stages for this attempt (no-op for cloud).
+    const watch = createLoadWatch(onLoading, isLocal);
     let res;
     try {
       res = await fetch(url(endpoint, '/chat/completions'), {
         method: 'POST',
-        headers: {
+        headers: authHeaders(apiKey, {
           'Content-Type': 'application/json',
-          Accept: stream ? 'text/event-stream' : 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
+          Accept: stream ? 'text/event-stream' : 'application/json'
+        }),
         body: JSON.stringify(body),
         signal
       });
     } catch (e) {
+      watch.stop();
       if (e.name === 'AbortError') throw apiError('Generation stopped.', 'aborted');
       throw apiError(`Network error: ${e.message}`, 'network');
     }
 
     if (!res.ok) {
+      watch.stop();
       const text = await res.text().catch(() => '');
       const err = errorForStatus(res.status, text, res.headers);
       if (err.code === 'rate_limit' && attempt < MAX_RATE_LIMIT_RETRIES && !signal?.aborted) {
@@ -286,8 +363,12 @@ async function sendMessage({ messages, settings, apiKey, onToken, signal, tools,
       throw err;
     }
 
+    // Headers in → model resident, prompt being processed (first token next).
+    watch.ready();
+
     // Non-streaming path: parse a single JSON payload.
     if (!stream) {
+      watch.stop();
       const data = await res.json();
       const msg = data?.choices?.[0]?.message || {};
       const flat = createReasoningFlattener();
@@ -298,8 +379,9 @@ async function sendMessage({ messages, settings, apiKey, onToken, signal, tools,
       return { content, toolCalls, usage: data?.usage || null, rateLimit };
     }
 
-    // Streaming path: parse SSE frames as they arrive.
-    return await parseSSE(res, onToken);
+    // Streaming path: parse SSE frames as they arrive. The watch is cleared the
+    // moment the first body chunk lands (model has begun producing output).
+    return await parseSSE(res, onToken, watch);
   }
 }
 
@@ -313,7 +395,7 @@ function parseToolCall(id, name, rawArgs) {
 }
 
 /** Read the SSE body, emit text deltas via onToken, accumulate tool calls. */
-async function parseSSE(res, onToken) {
+async function parseSSE(res, onToken, watch) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder('utf-8');
   let buffer = '';
@@ -334,6 +416,9 @@ async function parseSSE(res, onToken) {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
+      // First body chunk → the model is producing output; drop the load watch
+      // so no late "warming" stage fires once tokens (or tool calls) start.
+      if (watch) { watch.stop(); watch = null; }
       buffer += decoder.decode(value, { stream: true });
 
       // SSE frames are separated by a blank line.
@@ -392,13 +477,11 @@ async function parseSSE(res, onToken) {
 
 /** List available models (used by Settings to validate/refresh). */
 async function listModels({ settings, apiKey }) {
-  if (!apiKey) throw apiError('No API key configured.', 'auth');
-  const endpoint = settings.endpoint || DEFAULT_ENDPOINT;
+  const prov = providerConfig(settings);
+  if (prov.requiresKey && !apiKey) throw apiError('No API key configured.', 'auth');
   let res;
   try {
-    res = await fetch(url(endpoint, '/models'), {
-      headers: { Authorization: `Bearer ${apiKey}` }
-    });
+    res = await fetch(url(prov.endpoint, '/models'), { headers: authHeaders(apiKey) });
   } catch (e) {
     throw apiError(`Network error: ${e.message}`, 'network');
   }
@@ -408,7 +491,10 @@ async function listModels({ settings, apiKey }) {
   }
   const data = await res.json();
   const ids = Array.isArray(data?.data) ? data.data.map((m) => m.id) : [];
-  return ids.length ? ids : SUPPORTED_MODELS;
+  if (ids.length) return ids;
+  // LM Studio shows exactly what's currently loaded — no static fallback there;
+  // an empty list means "no model loaded". Mistral keeps its known catalogue.
+  return prov.provider === 'lmstudio' ? [] : SUPPORTED_MODELS;
 }
 
 /**
@@ -416,8 +502,9 @@ async function listModels({ settings, apiKey }) {
  * @returns {Promise<{ok:true, latency:number}>}
  */
 async function testConnection({ settings, apiKey }) {
-  if (!apiKey) throw apiError('No API key configured.', 'auth');
-  const endpoint = settings.endpoint || DEFAULT_ENDPOINT;
+  const prov = providerConfig(settings);
+  if (prov.requiresKey && !apiKey) throw apiError('No API key configured.', 'auth');
+  const endpoint = prov.endpoint;
   const started = Date.now();
 
   // 8s timeout so a dead endpoint doesn't hang the UI.
@@ -425,7 +512,7 @@ async function testConnection({ settings, apiKey }) {
   const timer = setTimeout(() => controller.abort(), 8000);
   try {
     const res = await fetch(url(endpoint, '/models'), {
-      headers: { Authorization: `Bearer ${apiKey}` },
+      headers: authHeaders(apiKey),
       signal: controller.signal
     });
     if (!res.ok) {
@@ -452,7 +539,9 @@ function clampNum(value, min, max, fallback) {
 module.exports = {
   DEFAULT_ENDPOINT,
   DEFAULT_MODEL,
+  LMSTUDIO_ENDPOINT,
   SUPPORTED_MODELS,
+  providerConfig,
   sendMessage,
   listModels,
   testConnection

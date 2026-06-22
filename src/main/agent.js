@@ -157,7 +157,9 @@ async function run({ baseMessages, settings, apiKey, signal, emit, requestApprov
         tools: toolSchemas,
         onToken: (delta) => { text += delta; emit({ type: 'token', delta }); },
         // Rate limited → tell the UI we're waiting and will retry (no rollback).
-        onRetry: (info) => emit({ type: 'rate-limit-wait', ...info })
+        onRetry: (info) => emit({ type: 'rate-limit-wait', ...info }),
+        // Local model loading into memory → surface the staged wait to the UI.
+        onLoading: (info) => emit({ type: 'model-loading', ...info })
       });
     } catch (e) {
       if (e.code === 'aborted') { emit({ type: 'done', content: '', aborted: true }); return; }

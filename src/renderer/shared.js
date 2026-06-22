@@ -234,7 +234,9 @@ export const store = {
 
 /* default settings mirror main.js so the renderer never reads `undefined`. */
 export const DEFAULT_SETTINGS = {
+  provider: 'mistral',
   endpoint: 'https://api.mistral.ai/v1',
+  lmstudioEndpoint: 'http://localhost:1234/v1',
   model: 'mistral-large-latest',
   temperature: 0.7,
   topP: 1,

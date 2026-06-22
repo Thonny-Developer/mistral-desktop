@@ -68,14 +68,20 @@ function drawSection(pane, settings) {
 /* ---------------- API section ---------------- */
 async function drawApi(pane, settings) {
   const locale = settings.locale || 'ru';
+  const isLm = (settings.provider || 'mistral') === 'lmstudio';
   const hasKey = await api.apiKey.has();
   const encrypted = await api.apiKey.isEncrypted();
+  const endpointVal = isLm ? (settings.lmstudioEndpoint || 'http://localhost:1234/v1') : settings.endpoint;
 
-  pane.innerHTML = `
-    <div class="set-section">
-      <div class="set-h">${t('API', locale)}</div>
-      <div class="set-sub">${t('Connection & authentication', locale)}</div>
-
+  // API-key row — Mistral only; LM Studio is keyless.
+  const keyRow = isLm ? `
+      <div class="setrow">
+        <div class="setlbl">
+          <div class="l1">Ключ не требуется</div>
+          <div class="l2">LM Studio работает локально. Запустите в нём сервер («Developer» → Start Server) и загрузите модель.</div>
+        </div>
+        <div class="setctl"></div>
+      </div>` : `
       <div class="setrow">
         <div class="setlbl">
           <div class="l1">${t('API key', locale)}</div>
@@ -94,12 +100,29 @@ async function drawApi(pane, settings) {
             ${hasKey ? `<button class="btn ghost sm danger" id="clearKey">${t('Remove', locale)}</button>` : ''}
           </div>
         </div>
-      </div>
+      </div>`;
+
+  pane.innerHTML = `
+    <div class="set-section">
+      <div class="set-h">${t('API', locale)}</div>
+      <div class="set-sub">${t('Connection & authentication', locale)}</div>
 
       <div class="setrow">
-        <div class="setlbl"><div class="l1">${t('Endpoint URL', locale)}</div></div>
+        <div class="setlbl"><div class="l1">Провайдер</div><div class="l2">Mistral API или локальный LM Studio</div></div>
+        <div class="setctl" style="max-width:320px">
+          <div class="seg-group" id="provider">
+            <button class="seg ${!isLm ? 'active' : ''}" data-v="mistral">Mistral</button>
+            <button class="seg ${isLm ? 'active' : ''}" data-v="lmstudio">LM Studio</button>
+          </div>
+        </div>
+      </div>
+
+      ${keyRow}
+
+      <div class="setrow">
+        <div class="setlbl"><div class="l1">${t('Endpoint URL', locale)}</div>${isLm ? '<div class="l2">Адрес локального сервера LM Studio</div>' : ''}</div>
         <div class="setctl">
-          <input class="field" id="endpoint" type="text" value="${escapeHtml(settings.endpoint)}" />
+          <input class="field" id="endpoint" type="text" value="${escapeHtml(endpointVal || '')}" />
         </div>
       </div>
 
@@ -112,33 +135,41 @@ async function drawApi(pane, settings) {
       </div>
     </div>`;
 
-  const keyInput = pane.querySelector('#apiKey');
-  pane.querySelector('#revealKey').addEventListener('click', () => {
-    keyInput.type = keyInput.type === 'password' ? 'text' : 'password';
+  bindSeg(pane.querySelector('#provider'), async (v) => {
+    settings.provider = v;
+    await saveSettings({ provider: v });
+    drawApi(pane, settings); // re-render so key/endpoint fields match the provider
   });
-  pane.querySelector('#saveKey').addEventListener('click', async () => {
-    const val = keyInput.value.trim();
-    if (!val) { keyInput.classList.add('invalid'); toast('Enter an API key first', 'error'); return; }
-    keyInput.classList.remove('invalid');
-    await api.apiKey.set(val);
-    keyInput.value = '';
-    keyInput.type = 'password';
-    toast(t('API key saved', locale), 'success');
-    drawApi(pane, settings);
-  });
-  pane.querySelector('#clearKey')?.addEventListener('click', async () => {
-    await api.apiKey.set('');
-    toast(t('API key removed', locale), 'info');
-    drawApi(pane, settings);
-  });
+
+  if (!isLm) {
+    const keyInput = pane.querySelector('#apiKey');
+    pane.querySelector('#revealKey').addEventListener('click', () => {
+      keyInput.type = keyInput.type === 'password' ? 'text' : 'password';
+    });
+    pane.querySelector('#saveKey').addEventListener('click', async () => {
+      const val = keyInput.value.trim();
+      if (!val) { keyInput.classList.add('invalid'); toast('Enter an API key first', 'error'); return; }
+      keyInput.classList.remove('invalid');
+      await api.apiKey.set(val);
+      keyInput.value = '';
+      keyInput.type = 'password';
+      toast(t('API key saved', locale), 'success');
+      drawApi(pane, settings);
+    });
+    pane.querySelector('#clearKey')?.addEventListener('click', async () => {
+      await api.apiKey.set('');
+      toast(t('API key removed', locale), 'info');
+      drawApi(pane, settings);
+    });
+  }
 
   const endpoint = pane.querySelector('#endpoint');
   endpoint.addEventListener('change', async () => {
     const val = endpoint.value.trim();
     if (!/^https?:\/\//.test(val)) { endpoint.classList.add('invalid'); toast(t('Endpoint must be a valid URL', locale), 'error'); return; }
     endpoint.classList.remove('invalid');
-    await saveSettings({ endpoint: val });
-    settings.endpoint = val;
+    if (isLm) { settings.lmstudioEndpoint = val; await saveSettings({ lmstudioEndpoint: val }); }
+    else { settings.endpoint = val; await saveSettings({ endpoint: val }); }
   });
 
   pane.querySelector('#testBtn').addEventListener('click', async () => {
@@ -168,17 +199,26 @@ function modelOptions(current) {
 
 async function drawModel(pane, settings) {
   const locale = settings.locale || 'ru';
+  const isLm = (settings.provider || 'mistral') === 'lmstudio';
   pane.innerHTML = `
     <div class="set-section">
       <div class="set-h">${t('Model', locale)}</div>
       <div class="set-sub">${t('Sampling & limits', locale)}</div>
 
       <div class="setrow">
-        <div class="setlbl"><div class="l1">${t('Model', locale)}</div><div class="l2" id="modelCtx">${escapeHtml((MODEL_INFO[settings.model] || {}).context || '')}</div></div>
-        <div class="setctl" style="max-width:300px">
-          <select class="field-box" id="model" style="width:100%">
-            ${modelOptions(settings.model)}
-          </select>
+        <div class="setlbl"><div class="l1">${t('Model', locale)}</div><div class="l2" id="modelCtx">${isLm ? 'Локальные модели LM Studio' : escapeHtml((MODEL_INFO[settings.model] || {}).context || '')}</div></div>
+        <div class="setctl" style="max-width:340px">
+          <div style="display:flex;gap:8px;align-items:center">
+            <select class="field-box" id="model" style="flex:1">
+              ${isLm
+                ? `<option value="${escapeHtml(settings.model || '')}">${escapeHtml(settings.model || 'загрузка…')}</option>`
+                : modelOptions(settings.model)}
+            </select>
+            ${isLm ? `<button class="icon-btn" id="modelRefresh" title="Запросить запущенные модели">
+              <svg viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5V5H11"/></svg>
+            </button>` : ''}
+          </div>
+          ${isLm ? '<div class="l2" id="modelHint" style="margin-top:8px">Запрашиваю запущенные модели…</div>' : ''}
         </div>
       </div>
 
@@ -213,10 +253,34 @@ async function drawModel(pane, settings) {
   pane.querySelector('#model').addEventListener('change', async (e) => {
     settings.model = e.target.value; // keep the in-memory copy in sync so the
     const ctx = pane.querySelector('#modelCtx'); // dropdown reflects the choice
-    if (ctx) ctx.textContent = (MODEL_INFO[e.target.value] || {}).context || ''; // on re-render
+    if (ctx && !isLm) ctx.textContent = (MODEL_INFO[e.target.value] || {}).context || ''; // on re-render
     await saveSettings({ model: e.target.value });
     toast(`Model set to ${e.target.value}`, 'success', 1600);
   });
+
+  // LM Studio: query the running server for the models it currently serves and
+  // fill the picker with them. A model not in the live list is auto-switched to
+  // the first available so we never send a model the server can't load.
+  if (isLm) {
+    const sel = pane.querySelector('#model');
+    const hint = pane.querySelector('#modelHint');
+    const loadModels = async () => {
+      hint.textContent = 'Запрашиваю запущенные модели…';
+      let ids = [];
+      try { ids = await api.mistral.models(); } catch { ids = []; }
+      if (!ids.length) {
+        sel.innerHTML = '<option value="">— модели не найдены —</option>';
+        hint.textContent = 'Модели не найдены. В LM Studio запустите сервер и загрузите модель, затем обновите.';
+        return;
+      }
+      const current = settings.model && ids.includes(settings.model) ? settings.model : ids[0];
+      sel.innerHTML = ids.map((m) => `<option value="${escapeHtml(m)}" ${m === current ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('');
+      hint.textContent = `Доступно моделей: ${ids.length}`;
+      if (current !== settings.model) { settings.model = current; await saveSettings({ model: current }); }
+    };
+    pane.querySelector('#modelRefresh').addEventListener('click', loadModels);
+    loadModels();
+  }
   bindSeg(pane.querySelector('#reasoningLevel'), async (v) => {
     settings.reasoningLevel = v;
     await saveSettings({ reasoningLevel: v });

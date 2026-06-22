@@ -26,7 +26,9 @@ const store = new Store({
   name: 'mistral-desktop',
   defaults: {
     settings: {
+      provider: 'mistral', // 'mistral' | 'lmstudio' (local OpenAI-compatible)
       endpoint: mistral.DEFAULT_ENDPOINT,
+      lmstudioEndpoint: mistral.LMSTUDIO_ENDPOINT,
       model: mistral.DEFAULT_MODEL,
       temperature: 0.7,
       topP: 1,
@@ -379,12 +381,15 @@ function getApiKey() {
  * ------------------------------------------------------------------ */
 async function runPluginAgent({ messages, permissionMode, requestApproval, onEvent, signal }) {
   const apiKey = getApiKey();
-  if (!apiKey) return { ok: false, error: 'API-ключ Mistral не задан в настройках приложения.' };
+  const settings = { ...store.get('settings'), aiPermissionMode: permissionMode || 'default' };
+  // LM Studio runs locally without a key; only Mistral needs one.
+  if (settings.provider !== 'lmstudio' && !apiKey) {
+    return { ok: false, error: 'API-ключ Mistral не задан в настройках приложения.' };
+  }
   // The folder is shared with the in-app chat; require it up-front so a
   // file/shell action never pops a desktop folder dialog from a remote trigger.
   if (!store.get('workingDir')) return { ok: false, error: 'no-workdir' };
 
-  const settings = { ...store.get('settings'), aiPermissionMode: permissionMode || 'default' };
   const baseMessages = [{ role: 'system', content: buildAgentSystem(settings) }, ...messages];
   const consoles = createConsoleManager();
   let finalContent = '';
@@ -639,7 +644,9 @@ ipcMain.handle('mistral:models', async () => {
   try {
     return await mistral.listModels({ settings, apiKey: getApiKey() });
   } catch {
-    return mistral.SUPPORTED_MODELS;
+    // LM Studio has no static catalogue — surface an empty list instead of
+    // Mistral names the local server can't serve.
+    return settings.provider === 'lmstudio' ? [] : mistral.SUPPORTED_MODELS;
   }
 });
 
