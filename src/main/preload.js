@@ -60,6 +60,10 @@ contextBridge.exposeInMainWorld('api', {
     respond: (approved) => ipcRenderer.send('agent:respond', approved),
     test: () => ipcRenderer.invoke('mistral:test'),
     models: () => ipcRenderer.invoke('mistral:models'),
+    // One-shot structured output: { messages, schema, schemaName } → { data, raw, usage }.
+    structured: (payload) => ipcRenderer.invoke('mistral:structured', payload),
+    // Codestral fill-in-the-middle: { prompt, suffix, stop?, maxTokens? } → { content, usage }.
+    fim: (payload) => ipcRenderer.invoke('mistral:fim', payload),
     // Returns an unsubscribe fn so pages can clean up listeners.
     onStream: (cb) => {
       const handler = (_e, msg) => cb(msg);

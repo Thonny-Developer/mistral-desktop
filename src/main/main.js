@@ -43,7 +43,13 @@ const store = new Store({
       reasoningLevel: 'medium',
       aiPermissionMode: 'default',
       activePresetId: 'general',
-      locale: 'ru'
+      locale: 'ru',
+      // Proactive rate limiter (see mistral.js rateGate): cap simultaneous
+      // requests and space their starts so bursts glide under Mistral's limit
+      // instead of tripping 429s. Defaults suit the free tier (serialise, no
+      // artificial spacing); raise the interval if you still hit limits.
+      maxConcurrentRequests: 1,
+      minRequestIntervalMs: 0
     },
     firstRunCompleted: false,
     sessions: [],
@@ -575,8 +581,12 @@ ipcMain.handle('updates:check', () => checkForUpdatesManually());
  *  IPC: Mistral API
  *  Streaming uses fire-and-forget `send` + push events on 'mistral:stream'.
  * ------------------------------------------------------------------ */
-ipcMain.on('mistral:send', async (event, { messages, allowedTools }) => {
-  const settings = store.get('settings');
+ipcMain.on('mistral:send', async (event, { messages, allowedTools, sessionId }) => {
+  const stored = store.get('settings');
+  // A stable per-conversation cache key lets Mistral reuse the fixed
+  // instruction+tools prefix across this chat's turns and messages (billed at a
+  // fraction of the input price). Scoped by chat so unrelated chats stay isolated.
+  const settings = sessionId ? { ...stored, promptCacheKey: `chat:${sessionId}` } : stored;
   const apiKey = getApiKey();
 
   // Abort any prior in-flight request before starting a new one.
@@ -661,6 +671,34 @@ ipcMain.handle('mistral:models', async () => {
     // LM Studio has no static catalogue — surface an empty list instead of
     // Mistral names the local server can't serve.
     return settings.provider === 'lmstudio' ? [] : mistral.SUPPORTED_MODELS;
+  }
+});
+
+// Structured output: force the reply into a JSON schema and return the parsed
+// object. For extraction/classification and anything that must be machine-read.
+ipcMain.handle('mistral:structured', async (_e, { messages, schema, schemaName } = {}) => {
+  const settings = store.get('settings');
+  try {
+    return await mistral.sendStructured({
+      messages: Array.isArray(messages) ? messages : [],
+      schema, schemaName, settings, apiKey: getApiKey()
+    });
+  } catch (e) {
+    return { error: e.message, code: e.code || 'unknown' };
+  }
+});
+
+// Fill-in-the-middle (Codestral): generate the code between `prompt` and
+// `suffix`. Non-streaming over IPC — returns the completed middle in one shot.
+ipcMain.handle('mistral:fim', async (_e, { prompt, suffix, stop, maxTokens, temperature } = {}) => {
+  const settings = store.get('settings');
+  try {
+    return await mistral.fimComplete({
+      prompt, suffix, stop, maxTokens, temperature,
+      settings, apiKey: getApiKey(), stream: false
+    });
+  } catch (e) {
+    return { error: e.message, code: e.code || 'unknown' };
   }
 });
 

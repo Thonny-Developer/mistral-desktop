@@ -126,6 +126,21 @@ async function drawApi(pane, settings) {
         </div>
       </div>
 
+      ${isLm ? '' : `
+      <div class="setrow">
+        <div class="setlbl"><div class="l1">Лимит запросов</div><div class="l2">Чтобы не ловить 429: сколько запросов идёт одновременно и минимальная пауза между их стартами. Для free-тарифа — 1 и небольшая пауза.</div></div>
+        <div class="setctl" style="display:flex;gap:10px;max-width:320px">
+          <label style="flex:1">
+            <div class="l2" style="margin-bottom:4px">Одновременно</div>
+            <input class="field" id="maxConc" type="number" min="1" max="16" step="1" value="${Number(settings.maxConcurrentRequests ?? 1)}" />
+          </label>
+          <label style="flex:1">
+            <div class="l2" style="margin-bottom:4px">Пауза, мс</div>
+            <input class="field" id="minInterval" type="number" min="0" max="60000" step="50" value="${Number(settings.minRequestIntervalMs ?? 0)}" />
+          </label>
+        </div>
+      </div>`}
+
       <div class="setrow">
         <div class="setlbl"><div class="l1">${t('Connection', locale)}</div></div>
         <div class="setctl wide" style="display:flex;align-items:center;gap:14px">
@@ -170,6 +185,24 @@ async function drawApi(pane, settings) {
     endpoint.classList.remove('invalid');
     if (isLm) { settings.lmstudioEndpoint = val; await saveSettings({ lmstudioEndpoint: val }); }
     else { settings.endpoint = val; await saveSettings({ endpoint: val }); }
+  });
+
+  // Proactive rate limiter (Mistral only) — cap concurrency and space starts.
+  const maxConc = pane.querySelector('#maxConc');
+  maxConc?.addEventListener('change', async () => {
+    let n = parseInt(maxConc.value, 10);
+    n = Number.isFinite(n) ? Math.min(16, Math.max(1, n)) : 1;
+    maxConc.value = n;
+    settings.maxConcurrentRequests = n;
+    await saveSettings({ maxConcurrentRequests: n });
+  });
+  const minInterval = pane.querySelector('#minInterval');
+  minInterval?.addEventListener('change', async () => {
+    let n = parseInt(minInterval.value, 10);
+    n = Number.isFinite(n) ? Math.min(60000, Math.max(0, n)) : 0;
+    minInterval.value = n;
+    settings.minRequestIntervalMs = n;
+    await saveSettings({ minRequestIntervalMs: n });
   });
 
   pane.querySelector('#testBtn').addEventListener('click', async () => {

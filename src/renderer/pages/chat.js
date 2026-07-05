@@ -559,7 +559,12 @@ async function render(container, ctx) {
   // Composer behaviour: Enter sends, Shift+Enter newlines; autosize; token count.
   const updateTokens = () => {
     const b = globalContextBreakdown();
-    tokMeta.textContent = `·  ${b.total.toLocaleString()} tok`;
+    // When Mistral serves part of the prefix from its cache, show how much — those
+    // tokens are billed at a fraction of the price, so it's the real prefix cost.
+    const cached = lastUsage?.prompt_tokens_details?.cached_tokens || 0;
+    tokMeta.textContent = cached > 0
+      ? `·  ${b.total.toLocaleString()} tok · ${cached.toLocaleString()} из кэша`
+      : `·  ${b.total.toLocaleString()} tok`;
     const pct = Math.min(1, b.total / ctxLimitFor(convo.model));
     ctxFill.style.strokeDasharray = RING.toFixed(2);
     ctxFill.style.strokeDashoffset = (RING * (1 - pct)).toFixed(2);
@@ -594,9 +599,15 @@ async function render(container, ctx) {
   };
   const noteRateLimitWait = (msg) => {
     const secs = Math.max(1, Math.round((msg.waitMs || 0) / 1000));
-    setStreamLabel(`лимит · повтор через ${secs}s`);
-    toast(`Достигнут лимит запросов. Жду ${secs} с и продолжаю… (попытка ${msg.attempt}/${msg.maxRetries})`,
-      'info', Math.min(6000, Math.max(2500, msg.waitMs || 3000)));
+    // The same retry channel now also carries transient network / 5xx waits.
+    const label = msg.reason === 'network' ? 'сеть' : msg.reason === 'server' ? 'сервер' : 'лимит';
+    setStreamLabel(`${label} · повтор через ${secs}s`);
+    const human = msg.reason === 'network'
+      ? `Проблема с сетью. Повтор через ${secs} с… (попытка ${msg.attempt}/${msg.maxRetries})`
+      : msg.reason === 'server'
+        ? `Сервер Mistral недоступен. Повтор через ${secs} с… (попытка ${msg.attempt}/${msg.maxRetries})`
+        : `Достигнут лимит запросов. Жду ${secs} с и продолжаю… (попытка ${msg.attempt}/${msg.maxRetries})`;
+    toast(human, 'info', Math.min(6000, Math.max(2500, msg.waitMs || 3000)));
   };
 
   // --- Local model loading indicator ---------------------------------------
@@ -608,7 +619,7 @@ async function render(container, ctx) {
   const LOAD_STAGES = [
     { k: 'connect', label: 'Подключение к локальному серверу' },
     { k: 'load', label: 'Загрузка модели в память' },
-    { k: 'warm', label: 'Обработка запроса' }
+    { k: 'warm', label: 'Обработка запроса :3' }
   ];
   function showModelLoading(msg) {
     const slot = container.querySelector('.asst-row:last-child .msg-content');
@@ -628,7 +639,7 @@ async function render(container, ctx) {
         ? `
         <div class="ml-head">
           <span class="ml-spin"></span>
-          <span class="ml-title">Обработка запроса</span>
+          <span class="ml-title">Обработка запроса :3</span>
           <span class="ml-elapsed" id="mlElapsed">0&nbsp;с</span>
         </div>`
         : `
@@ -823,6 +834,9 @@ async function render(container, ctx) {
       userContent = parts;
     }
     const userMsg = { role: 'user', content: userContent };
+    // A /skill invocation carries the whole playbook as its content, but we
+    // show a compact pill instead of the full text (see paintThread).
+    if (opts.skillInvoke) userMsg.skillInvoke = opts.skillInvoke;
     if (imgs.length) userMsg.imageTokens = imgs.reduce((s, i) => s + i.tokens, 0);
     // Attached documents: keep the extracted text as message metadata (shown as
     // a file chip, folded into the outgoing content at send time) so the model
@@ -1035,7 +1049,7 @@ async function render(container, ctx) {
       }
     });
 
-    api.mistral.send({ messages: outgoing, allowedTools: opts.allowedTools });
+    api.mistral.send({ messages: outgoing, allowedTools: opts.allowedTools, sessionId: convo.savedId || convo.id });
 
     function finish(aborted, content) {
       cleanupStream();
@@ -1129,7 +1143,13 @@ async function render(container, ctx) {
     catch { rendered = null; }
     if (!rendered) { toast(`Скилл /${name} не найден`, 'error'); return; }
     composer.value = rendered.prompt;
-    await send({ allowedTools: rendered.allowedTools, skillName: rendered.name });
+    await send({
+      allowedTools: rendered.allowedTools,
+      skillName: rendered.name,
+      // fold the playbook body into a compact pill in the UI; the model still
+      // receives the full prompt from composer.value
+      skillInvoke: { name: rendered.name, arg: arg || '' }
+    });
   }
 
   async function initMistralFile() {
@@ -1172,6 +1192,13 @@ function paintThread(thread, streamingLast = false) {
   }
   thread.innerHTML = convo.messages.map((m, i) => {
     if (m.role === 'user') {
+      // Skill invocation: fold the full playbook into a compact pill.
+      if (m.skillInvoke) {
+        const argHtml = m.skillInvoke.arg
+          ? ` <span class="skill-invoke-arg">${escapeHtml(m.skillInvoke.arg)}</span>`
+          : '';
+        return `<div class="msg-row user"><div class="skill-invoke">✦ Скилл <b>/${escapeHtml(m.skillInvoke.name)}</b>${argHtml}</div></div>`;
+      }
       const utext = contentText(m.content);
       const uimgs = contentImages(m.content);
       const imgsHtml = uimgs.length
@@ -1224,8 +1251,10 @@ function splitTurn(raw, reasonSecs = 0) {
   const rest = t.slice(i + open[0].length);
   const end = rest.search(/<\/details>/i);
   if (end === -1) {
-    // Reasoning still streaming → show it open ("Думает"), nothing to type yet.
-    return { head: renderMarkdown('<details open>' + rest + '</details>'), typed: before };
+    // Reasoning still streaming → collapsed pill ("Думает… · N токенов"); the
+    // thoughts stay hidden (data-live drives the live spinner/counter), and
+    // there's nothing to type out yet.
+    return { head: renderMarkdown('<details data-live="1">' + rest + '</details>'), typed: before };
   }
   const inner = rest.slice(0, end);
   const after = rest.slice(end + '</details>'.length);
@@ -1322,8 +1351,12 @@ function createLiveView(thread, onReveal) {
         resetLive(''); // the previous turn was folded into `committed`
       }
       // Reasoning block: already-rendered HTML, refreshed only when it changes.
+      // Preserve a mid-stream peek — if the user expanded the pill to watch the
+      // thoughts, keep it open across the re-render instead of snapping shut.
       if (head !== headShown) {
+        const wasOpen = headEl.querySelector('details')?.open;
         headEl.innerHTML = head;
+        if (wasOpen) headEl.querySelector('details')?.setAttribute('open', '');
         bindCopyButtons(headEl);
         headShown = head;
       }

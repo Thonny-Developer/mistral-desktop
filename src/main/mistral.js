@@ -216,6 +216,10 @@ function abortableDelay(ms, signal) {
 }
 
 const MAX_RATE_LIMIT_RETRIES = 5;
+// Transient failures (a dropped connection, a 5xx from the gateway) are usually
+// momentary — we back off and retry a few times before surfacing the error,
+// instead of failing the whole turn on the first blip.
+const MAX_TRANSIENT_RETRIES = 3;
 
 /**
  * Staged loading reporter for local models.
@@ -273,6 +277,144 @@ function extractRateLimitInfo(headers) {
 }
 
 /**
+ * Proactive request limiter (process-global).
+ *
+ * The Mistral limit is enforced on two axes — requests/second and tokens/minute
+ * — and it is cheaper to glide under it than to recover from a 429. This gate
+ * sits in front of every outgoing request and does two things:
+ *   • caps how many requests may be in flight at once (`maxConcurrent`; 1 is the
+ *     right default for the free tier),
+ *   • spaces consecutive request starts by at least `minIntervalMs`.
+ * So a burst — the agent's rapid tool-loop, or the in-app chat racing a plugin —
+ * is smoothed out instead of colliding into retries. Config is applied live from
+ * settings, so tuning it in the UI takes effect on the very next request. There
+ * is never a deadlock: a request always releases its slot before any nested one
+ * (a subagent, the next turn) is issued.
+ */
+const rateGate = (() => {
+  let active = 0;
+  let lastStart = 0;
+  let timer = null;
+  const waiters = [];
+  const cfg = { maxConcurrent: 1, minIntervalMs: 0 };
+
+  function pump() {
+    timer = null;
+    while (waiters.length && active < cfg.maxConcurrent) {
+      const wait = lastStart + cfg.minIntervalMs - Date.now();
+      if (wait > 0) { timer = setTimeout(pump, wait); return; } // hold for spacing
+      active++;
+      lastStart = Date.now();
+      waiters.shift()(); // grant the slot
+    }
+  }
+
+  return {
+    configure(maxConcurrent, minIntervalMs) {
+      cfg.maxConcurrent = Math.max(1, Math.floor(maxConcurrent) || 1);
+      cfg.minIntervalMs = Math.max(0, Math.floor(minIntervalMs) || 0);
+      if (!timer) pump(); // a looser config may unblock queued waiters at once
+    },
+    // Resolves with a one-shot release() to call when the request is done.
+    acquire() {
+      return new Promise((resolve) => {
+        waiters.push(() => resolve(() => { active = Math.max(0, active - 1); pump(); }));
+        pump();
+      });
+    }
+  };
+})();
+
+/** Derive the gate's config from user settings (safe defaults for the free tier). */
+function gateConfigFromSettings(settings) {
+  return {
+    maxConcurrent: clampNum(settings && settings.maxConcurrentRequests, 1, 16, 1),
+    minIntervalMs: clampNum(settings && settings.minRequestIntervalMs, 0, 60000, 0)
+  };
+}
+
+/**
+ * Fire one POST and hand back the live (successful) response, transparently
+ * retrying the two failure classes that are worth retrying:
+ *   • 429 (rate limit)  — honour Retry-After, up to MAX_RATE_LIMIT_RETRIES.
+ *   • network drop / 5xx — back off exponentially, up to MAX_TRANSIENT_RETRIES.
+ * Everything else throws its coded error straight away. A retry is always clean
+ * here: we only ever retry before any body byte has been read, so no partial
+ * output can leak. Rate-limit and transient budgets are counted separately so a
+ * burst of one kind can't exhaust the other's allowance.
+ *
+ * @returns {Promise<{res: Response, watch: {ready:Function, stop:Function}}>}
+ *          The caller owns the body and must drive `watch.ready()/stop()`.
+ */
+async function requestWithRetries({ endpoint, path, apiKey, body, signal, stream, onRetry, onLoading, isLocal, gate }) {
+  if (gate) rateGate.configure(gate.maxConcurrent, gate.minIntervalMs);
+  let rateLimitAttempts = 0;
+  let transientAttempts = 0;
+  // eslint-disable-next-line no-constant-condition
+  for (;;) {
+    // Staged local-model load reporter for this attempt (no-op for cloud).
+    const watch = createLoadWatch(onLoading, isLocal);
+    // Wait for a slot: enforces the min interval between starts and the cap on
+    // concurrent requests. Released the moment headers land so the slot frees up
+    // while the body streams. Retries pass through the gate too, so a backoff
+    // never fires a burst.
+    const release = await rateGate.acquire();
+    let res;
+    try {
+      res = await fetch(url(endpoint, path), {
+        method: 'POST',
+        headers: authHeaders(apiKey, {
+          'Content-Type': 'application/json',
+          Accept: stream ? 'text/event-stream' : 'application/json'
+        }),
+        body: JSON.stringify(body),
+        signal
+      });
+    } catch (e) {
+      release();
+      watch.stop();
+      if (e.name === 'AbortError') throw apiError('Generation stopped.', 'aborted');
+      // A dropped/refused connection — momentary in most cases. Back off and retry.
+      if (transientAttempts < MAX_TRANSIENT_RETRIES && !signal?.aborted) {
+        transientAttempts++;
+        const waitMs = backoffMs(null, transientAttempts);
+        if (onRetry) onRetry({ attempt: transientAttempts, maxRetries: MAX_TRANSIENT_RETRIES, waitMs, reason: 'network' });
+        await abortableDelay(waitMs, signal); // throws 'aborted' if the user stops
+        continue;
+      }
+      throw apiError(`Network error: ${e.message}`, 'network');
+    }
+    // Headers are in — free the slot so the next request can start while this
+    // one's body is still streaming.
+    release();
+
+    if (!res.ok) {
+      watch.stop();
+      const text = await res.text().catch(() => '');
+      const err = errorForStatus(res.status, text, res.headers);
+      if (err.code === 'rate_limit' && rateLimitAttempts < MAX_RATE_LIMIT_RETRIES && !signal?.aborted) {
+        rateLimitAttempts++;
+        const waitMs = backoffMs(err.retryAfterMs, rateLimitAttempts);
+        if (onRetry) onRetry({ attempt: rateLimitAttempts, maxRetries: MAX_RATE_LIMIT_RETRIES, waitMs, rateLimit: err.rateLimit });
+        await abortableDelay(waitMs, signal);
+        continue;
+      }
+      // 5xx from the API/gateway — treat like a transient blip and retry.
+      if (err.code === 'server' && transientAttempts < MAX_TRANSIENT_RETRIES && !signal?.aborted) {
+        transientAttempts++;
+        const waitMs = backoffMs(err.retryAfterMs, transientAttempts);
+        if (onRetry) onRetry({ attempt: transientAttempts, maxRetries: MAX_TRANSIENT_RETRIES, waitMs, reason: 'server' });
+        await abortableDelay(waitMs, signal);
+        continue;
+      }
+      throw err;
+    }
+
+    return { res, watch };
+  }
+}
+
+/**
  * Stream a chat completion.
  *
  * @param {Object}   opts
@@ -284,7 +426,7 @@ function extractRateLimitInfo(headers) {
  * @param {Array}    opts.tools          Optional tool/function schemas for native tool-calling.
  * @returns {Promise<{content:string, toolCalls:Array, usage:Object|null}>}
  */
-async function sendMessage({ messages, settings, apiKey, onToken, signal, tools, onRetry, onLoading }) {
+async function sendMessage({ messages, settings, apiKey, onToken, signal, tools, onRetry, onLoading, responseFormat }) {
   const prov = providerConfig(settings);
   if (prov.requiresKey && !apiKey) throw apiError('No API key configured. Add one in Settings.', 'auth');
 
@@ -326,63 +468,42 @@ async function sendMessage({ messages, settings, apiKey, onToken, signal, tools,
   const maxTokens = parseInt(settings.maxTokens, 10);
   if (Number.isFinite(maxTokens) && maxTokens > 0) body.max_tokens = maxTokens;
 
-  // On a rate limit (429) we don't fail the turn — we wait the time the API
-  // tells us to (or back off) and retry, so the conversation keeps going
-  // instead of being rolled back. Nothing has streamed yet at this point (the
-  // error is raised before the body is read), so a retry is clean.
-  for (let attempt = 0; ; attempt++) {
-    // Report the local-model load stages for this attempt (no-op for cloud).
-    const watch = createLoadWatch(onLoading, isLocal);
-    let res;
-    try {
-      res = await fetch(url(endpoint, '/chat/completions'), {
-        method: 'POST',
-        headers: authHeaders(apiKey, {
-          'Content-Type': 'application/json',
-          Accept: stream ? 'text/event-stream' : 'application/json'
-        }),
-        body: JSON.stringify(body),
-        signal
-      });
-    } catch (e) {
-      watch.stop();
-      if (e.name === 'AbortError') throw apiError('Generation stopped.', 'aborted');
-      throw apiError(`Network error: ${e.message}`, 'network');
-    }
-
-    if (!res.ok) {
-      watch.stop();
-      const text = await res.text().catch(() => '');
-      const err = errorForStatus(res.status, text, res.headers);
-      if (err.code === 'rate_limit' && attempt < MAX_RATE_LIMIT_RETRIES && !signal?.aborted) {
-        const waitMs = backoffMs(err.retryAfterMs, attempt + 1);
-        if (onRetry) onRetry({ attempt: attempt + 1, maxRetries: MAX_RATE_LIMIT_RETRIES, waitMs, rateLimit: err.rateLimit });
-        await abortableDelay(waitMs, signal); // throws 'aborted' if the user stops
-        continue;
-      }
-      throw err;
-    }
-
-    // Headers in → model resident, prompt being processed (first token next).
-    watch.ready();
-
-    // Non-streaming path: parse a single JSON payload.
-    if (!stream) {
-      watch.stop();
-      const data = await res.json();
-      const msg = data?.choices?.[0]?.message || {};
-      const flat = createReasoningFlattener();
-      const content = flat.push(msg.content) + flat.flush();
-      if (onToken && content) onToken(content);
-      const toolCalls = (msg.tool_calls || []).map((tc, i) => parseToolCall(tc.id || `call_${i}`, tc.function?.name, tc.function?.arguments));
-      const rateLimit = extractRateLimitInfo(res.headers);
-      return { content, toolCalls, usage: data?.usage || null, rateLimit };
-    }
-
-    // Streaming path: parse SSE frames as they arrive. The watch is cleared the
-    // moment the first body chunk lands (model has begun producing output).
-    return await parseSSE(res, onToken, watch);
+  // Server-side prompt caching (Mistral cloud only): a stable per-conversation
+  // key lets the API reuse the fixed instruction+tools prefix across turns and
+  // messages at ~10% of the input price. LM Studio has no such feature.
+  if (prov.provider === 'mistral' && settings.promptCacheKey) {
+    body.prompt_cache_key = String(settings.promptCacheKey);
   }
+  // Structured outputs: pin the reply to a JSON schema when the caller asks.
+  if (responseFormat) body.response_format = responseFormat;
+
+  // Rate limits and transient blips (network drop / 5xx) are retried inside the
+  // helper without rolling the turn back — nothing has streamed yet, so it is
+  // clean. Any other failure throws a coded error for the caller to surface.
+  const { res, watch } = await requestWithRetries({
+    endpoint, path: '/chat/completions', apiKey, body, signal, stream, onRetry, onLoading, isLocal,
+    gate: gateConfigFromSettings(settings)
+  });
+
+  // Headers in → model resident, prompt being processed (first token next).
+  watch.ready();
+
+  // Non-streaming path: parse a single JSON payload.
+  if (!stream) {
+    watch.stop();
+    const data = await res.json();
+    const msg = data?.choices?.[0]?.message || {};
+    const flat = createReasoningFlattener();
+    const content = flat.push(msg.content) + flat.flush();
+    if (onToken && content) onToken(content);
+    const toolCalls = (msg.tool_calls || []).map((tc, i) => parseToolCall(tc.id || `call_${i}`, tc.function?.name, tc.function?.arguments));
+    const rateLimit = extractRateLimitInfo(res.headers);
+    return { content, toolCalls, usage: data?.usage || null, rateLimit };
+  }
+
+  // Streaming path: parse SSE frames as they arrive. The watch is cleared the
+  // moment the first body chunk lands (model has begun producing output).
+  return await parseSSE(res, onToken, watch);
 }
 
 /** Finalise an accumulated tool call: parse its JSON arguments (or flag error). */
@@ -475,6 +596,108 @@ async function parseSSE(res, onToken, watch) {
   return { content: full, toolCalls: finalize(), usage, rateLimit };
 }
 
+/**
+ * One-shot structured completion: force the reply into a JSON schema and hand
+ * back the parsed object. No tools, no streaming — this is the reliable path
+ * for extraction/classification/anything that must be machine-readable.
+ *
+ * @param {Object} opts
+ * @param {Array}  opts.messages     Conversation [{role, content}, ...].
+ * @param {Object} opts.schema       A JSON Schema object the reply must satisfy.
+ * @param {string} [opts.schemaName] Name for the schema (defaults to 'response').
+ * @returns {Promise<{data:Object|null, raw:string, usage:Object|null, parseError:string|null}>}
+ */
+async function sendStructured({ messages, settings, apiKey, schema, schemaName, signal }) {
+  const prov = providerConfig(settings);
+  if (prov.requiresKey && !apiKey) throw apiError('No API key configured. Add one in Settings pls X_X', 'auth');
+  if (!schema || typeof schema !== 'object') throw apiError('sendStructured requires a JSON schema object.', 'bad_request');
+
+  const model = (settings && typeof settings.model === 'string' && settings.model.trim())
+    ? settings.model.trim()
+    : DEFAULT_MODEL;
+  const body = {
+    model,
+    messages,
+    temperature: 0, // deterministic — extraction should be reproducible
+    stream: false,
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: schemaName || 'response', schema, strict: true }
+    }
+  };
+  if (prov.provider === 'mistral' && settings && settings.promptCacheKey) {
+    body.prompt_cache_key = String(settings.promptCacheKey);
+  }
+
+  const { res, watch } = await requestWithRetries({
+    endpoint: prov.endpoint, path: '/chat/completions', apiKey, body, signal, stream: false, isLocal: false,
+    gate: gateConfigFromSettings(settings)
+  });
+  watch.stop();
+  const data = await res.json();
+  const raw = contentToText(data?.choices?.[0]?.message?.content);
+  let parsed = null;
+  let parseError = null;
+  try { parsed = JSON.parse(raw); } catch (e) { parseError = e.message; }
+  return { data: parsed, raw, usage: data?.usage || null, parseError };
+}
+
+/**
+ * Fill-in-the-middle completion (Codestral). Given the code BEFORE the cursor
+ * (`prompt`) and, optionally, the code AFTER it (`suffix`), the model generates
+ * the missing middle. This is Codestral's native completion mode, exposed at a
+ * dedicated endpoint — great for inserting code at a known location without
+ * rewriting the whole file.
+ *
+ * FIM is a Mistral-cloud capability: the OpenAI-compatible LM Studio server has
+ * no `/fim/completions` route, so this refuses the local provider.
+ *
+ * @param {Object}   opts
+ * @param {string}   opts.prompt        Code before the insertion point.
+ * @param {string}   [opts.suffix]      Code after the insertion point.
+ * @param {Function} [opts.onToken]     If given (and stream !== false), streams deltas.
+ * @param {string[]} [opts.stop]        Optional stop sequences.
+ * @returns {Promise<{content:string, usage:Object|null}>}
+ */
+async function fimComplete({ prompt, suffix, settings, apiKey, signal, onToken, stream, stop, maxTokens, temperature }) {
+  const prov = providerConfig(settings);
+  if (prov.provider !== 'mistral') throw apiError('Дополнение кода (FIM) доступно только с облачной моделью Codestral X_X', 'unsupported');
+  if (!apiKey) throw apiError('No API key configured. Add one in Settings pls X_X', 'auth');
+  if (prompt == null) throw apiError('fimComplete requires "prompt".', 'bad_request');
+
+  // FIM only works on the Codestral family. Honour the user's model if it is a
+  // Codestral variant, else fall back to the latest Codestral.
+  const selected = (settings && typeof settings.model === 'string') ? settings.model.trim() : '';
+  const model = /codestral/i.test(selected) ? selected : 'codestral-latest';
+
+  const doStream = stream !== false && typeof onToken === 'function';
+  const body = { model, prompt: String(prompt), stream: doStream };
+  if (suffix != null) body.suffix = String(suffix);
+  const mt = parseInt(maxTokens, 10);
+  if (Number.isFinite(mt) && mt > 0) body.max_tokens = mt;
+  const temp = parseFloat(temperature);
+  if (Number.isFinite(temp)) body.temperature = clampNum(temp, 0, 1.5, 0.2);
+  if (Array.isArray(stop) && stop.length) body.stop = stop;
+
+  const { res, watch } = await requestWithRetries({
+    endpoint: prov.endpoint, path: '/fim/completions', apiKey, body, signal, stream: doStream, isLocal: false,
+    gate: gateConfigFromSettings(settings)
+  });
+  watch.ready();
+
+  if (!doStream) {
+    watch.stop();
+    const data = await res.json();
+    const choice = data?.choices?.[0] || {};
+    const content = contentToText(choice.message?.content ?? choice.text ?? '');
+    return { content, usage: data?.usage || null };
+  }
+  // Streaming FIM frames carry the same `choices[].delta.content` shape as chat,
+  // so the shared SSE parser handles them (there are never tool calls here).
+  const r = await parseSSE(res, onToken, watch);
+  return { content: r.content, usage: r.usage };
+}
+
 /** List available models (used by Settings to validate/refresh). */
 async function listModels({ settings, apiKey }) {
   const prov = providerConfig(settings);
@@ -543,6 +766,8 @@ module.exports = {
   SUPPORTED_MODELS,
   providerConfig,
   sendMessage,
+  sendStructured,
+  fimComplete,
   listModels,
   testConnection
 };

@@ -333,11 +333,93 @@ export function stripAgentTags(text) {
     .replace(/<remember>[\s\S]*$/i, '');
 }
 
+// Regexes for pulling reasoning blocks out of the raw text before markdown
+// parsing: a fully-closed block, or a still-streaming one with no closing tag yet.
+const RE_DETAILS_CLOSED = /<details\b([^>]*)>([\s\S]*?)<\/details>/gi;
+const RE_DETAILS_OPEN = /<details\b([^>]*)>([\s\S]*)$/i;
+
+/**
+ * Build the reasoning "pill" DOM from an extracted block. We render it ourselves
+ * (instead of letting the model's raw `<details>` reach marked) because that raw
+ * HTML breaks markdown parsing — e.g. a blank line inside the thought terminates
+ * marked's HTML block and leaks the literal tags into the page. The pill stays
+ * collapsed; the thought is markdown-rendered inside the animated body.
+ */
+function buildReasoningPill({ attrs, inner, open }) {
+  const attr = attrs || '';
+  const thinking = !!open || /\bdata-live\b/i.test(attr); // still streaming
+  // Drop the model's own <summary>…</summary>; we render our own label.
+  const bodyMd = String(inner || '').replace(/<summary\b[^>]*>[\s\S]*?<\/summary>/i, '').trim();
+  const secsM = /data-secs\s*=\s*["']?(\d+)/i.exec(attr);
+  const secs = secsM ? parseInt(secsM[1], 10) : 0;
+  const toks = Math.ceil(bodyMd.length / 4);
+
+  const d = document.createElement('details');
+  const summary = document.createElement('summary');
+  summary.className = thinking ? 'think think-live' : 'think';
+
+  const ico = document.createElement('span');
+  ico.className = thinking ? 'think-ico think-spin' : 'think-ico think-dot';
+  summary.appendChild(ico);
+
+  const label = document.createElement('span');
+  label.className = 'think-label';
+  if (thinking) {
+    [...'Думает'].forEach((ch, idx) => {
+      const s = document.createElement('span');
+      s.className = 'think-ch';
+      s.style.animationDelay = `${idx * 0.09}s`;
+      s.textContent = ch;
+      label.appendChild(s);
+    });
+  } else {
+    label.textContent = secs > 0 ? `Думал ${secs} сек` : 'Рассуждения';
+  }
+  summary.appendChild(label);
+
+  if (toks > 0) {
+    const meta = document.createElement('span');
+    meta.className = 'think-meta';
+    meta.textContent = `· ${toks.toLocaleString()} ${thinking ? 'токенов' : 'ток.'}`;
+    summary.appendChild(meta);
+  }
+  d.appendChild(summary);
+
+  // The thought itself — markdown-rendered, wrapped so opening animates height.
+  const body = document.createElement('div');
+  body.className = 'reason-body';
+  const innerEl = document.createElement('div');
+  innerEl.className = 'reason-inner';
+  innerEl.innerHTML = marked.parse(bodyMd);
+  body.appendChild(innerEl);
+  d.appendChild(body);
+  return d;
+}
+
 export function renderMarkdown(text) {
   // Hide agent directives from the UI; their effects are shown as tool lines
   // and their persistence happens in the main process.
+  const cleaned = stripAgentTags(text);
+
+  // Pull reasoning blocks OUT before markdown parsing and swap in a placeholder
+  // paragraph for each. Letting the raw `<details>` reach marked is exactly what
+  // produced the "raw <details><summary>Думает</summary>…" leak: a blank line
+  // inside the thought (or the block's position) breaks marked's HTML-block
+  // rules. We rebuild each block into a proper pill afterwards, so reasoning is
+  // ALWAYS a pill and the surrounding answer is ALWAYS clean markdown.
+  const blocks = [];
+  const src = cleaned
+    .replace(RE_DETAILS_CLOSED, (_m, attrs, inner) => {
+      const i = blocks.push({ attrs, inner, open: false }) - 1;
+      return `\n\nRSNBLOCK${i}RSNBLOCK\n\n`;
+    })
+    .replace(RE_DETAILS_OPEN, (_m, attrs, inner) => {
+      const i = blocks.push({ attrs, inner, open: true }) - 1;
+      return `\n\nRSNBLOCK${i}RSNBLOCK\n\n`;
+    });
+
   const tmp = document.createElement('div');
-  tmp.innerHTML = marked.parse(stripAgentTags(text));
+  tmp.innerHTML = marked.parse(src);
 
   tmp.querySelectorAll('pre > code').forEach((code) => {
     // Detect the language from the `language-xxx` class marked emits.
@@ -366,38 +448,17 @@ export function renderMarkdown(text) {
     wrap.appendChild(btn);
   });
 
-  // Reasoning blocks (`<details><summary>…</summary>…`) get a normalized label.
-  // While the model is still thinking the block streams in open — show an
-  // animated, per-letter "Думает". Once it's closed, show "Думал N сек
-  // (M токенов)" — the duration is baked into the tag as data-secs during
-  // streaming, the token count is estimated from the body length. Runs on every
-  // render path (live, committed, history).
-  tmp.querySelectorAll('details').forEach((d) => {
-    const summary = d.querySelector('summary');
-    if (!summary) return;
-    const bodyLen = Math.max(0, (d.textContent || '').length - (summary.textContent || '').length);
-    const toks = Math.ceil(bodyLen / 4);
-    const thinking = d.hasAttribute('open'); // open === still streaming in
-    summary.classList.add('think');
-    summary.innerHTML = '';
-    if (thinking) {
-      summary.classList.add('think-live');
-      // Per-letter highlight wave so it reads as "loading".
-      [...'Думает'].forEach((ch, idx) => {
-        const s = document.createElement('span');
-        s.className = 'think-ch';
-        s.style.animationDelay = `${idx * 0.09}s`;
-        s.textContent = ch;
-        summary.appendChild(s);
-      });
-    } else {
-      const secs = parseInt(d.getAttribute('data-secs') || '0', 10);
-      let label = 'Думал';
-      if (secs > 0) label += ` ${secs} сек`;
-      if (toks > 0) label += ` (${toks.toLocaleString()} ток.)`;
-      summary.textContent = label;
-    }
-  });
+  // Splice the reasoning pills back in: each extracted block left a placeholder
+  // paragraph (`<p>RSNBLOCK<i>RSNBLOCK</p>`) — swap it for the rebuilt pill. This
+  // is the ONLY place reasoning becomes DOM, so it can never leak as raw text.
+  if (blocks.length) {
+    tmp.querySelectorAll('p').forEach((p) => {
+      const m = /^RSNBLOCK(\d+)RSNBLOCK$/.exec((p.textContent || '').trim());
+      if (!m) return;
+      const b = blocks[Number(m[1])];
+      if (b) p.replaceWith(buildReasoningPill(b));
+    });
+  }
 
   return tmp.innerHTML;
 }
