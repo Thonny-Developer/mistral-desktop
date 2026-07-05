@@ -7,6 +7,9 @@
         content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; script-src 'self';" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Mistral Desktop</title>
+  <!-- Apply the persisted theme synchronously, before first paint, so the boot
+       splash renders in the user's theme with no flash. -->
+  <script src="boot-theme.js"></script>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" />
   <link rel="stylesheet" href="styles/base.css" />
   <link rel="stylesheet" href="styles/layout.css" />
@@ -15,7 +18,17 @@
   <link rel="stylesheet" href="vendor/highlight-theme.css" />
 </head>
 <body>
-  <div class="app">
+  <!-- ============ boot splash (theme-colored; removed by splash.js once ready) ============ -->
+  <div class="splash" id="splash">
+    <div class="splash-stage">
+      <div class="splash-mark" aria-hidden="true">✦</div>
+      <div class="splash-brand">Mistral Desktop</div>
+      <div class="splash-status" id="splashStatus">Запуск…</div>
+      <div class="splash-track"><div class="splash-bar" id="splashBar"></div></div>
+    </div>
+  </div>
+
+  <div class="app pre-boot">
     <!-- ============ custom titlebar (drag region) ============ -->
     <div class="titlebar" id="titlebar">
       <button class="tb-back" id="tbBack" title="Back to chat" aria-label="Back to chat" hidden>

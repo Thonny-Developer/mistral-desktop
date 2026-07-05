@@ -6,6 +6,7 @@ import chatPage from './pages/chat.js';
 import settingsPage from './pages/settings.js';
 import historyPage from './pages/history.js';
 import aboutPage from './pages/about.js';
+import { createSplash } from './splash.js';
 
 const api = window.api;
 
@@ -250,8 +251,16 @@ async function showFirstRunDialog() {
 /* ---------------- theme + window state ---------------- */
 async function applyTheme() {
   settings = await getSettings();
-  document.documentElement.dataset.theme = settings.theme || 'dark';
-  document.documentElement.style.setProperty('--font-size', `${settings.fontSize || 14}px`);
+  const theme = settings.theme || 'dark';
+  const fontSize = settings.fontSize || 14;
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.style.setProperty('--font-size', `${fontSize}px`);
+  // Mirror to localStorage so boot-theme.js can apply it synchronously on the
+  // next launch (before first paint) and avoid a theme flash on the splash.
+  try {
+    localStorage.setItem('theme', theme);
+    localStorage.setItem('fontSize', String(fontSize));
+  } catch { /* localStorage unavailable — non-fatal */ }
   toggleSidebar(!!settings.collapseSidebar);
 }
 
@@ -364,13 +373,47 @@ function focusComposer() {
 }
 
 /* ---------------- boot ---------------- */
+/* Real update check, time-boxed so the splash never hangs on a slow network.
+ * The main process still pops its own download dialog if an update is found. */
+async function checkForUpdates() {
+  try {
+    const timeout = new Promise((resolve) => setTimeout(() => resolve({ status: 'timeout' }), 4000));
+    return await Promise.race([api.updates.check(), timeout]);
+  } catch {
+    return { status: 'error' };
+  }
+}
+
 async function boot() {
   await refreshLocale();
   await applyTheme();
+
+  const splash = createSplash();
+
+  // 1) Check for a newer version.
+  await splash.phase(t('Checking for updates', locale), 18);
+  const update = await checkForUpdates();
+  if (update?.status === 'available') {
+    await splash.phase(`${t('Update available', locale)} ${update.version || ''}`.trim(), 42, 1100);
+  } else if (update?.status === 'latest') {
+    await splash.phase(t('Up to date', locale), 42, 360);
+  } else {
+    splash.setProgress(42); // dev / timeout / error — move on quietly
+  }
+
+  // 2) Build the interface behind the splash.
+  await splash.phase(t('Loading interface', locale), 72);
   renderNav();
   wireWindowControls();
   wireShortcuts();
+  await navigate('chat');
+  splash.setProgress(92);
 
+  // 3) Reveal the app, then fade the splash away.
+  await splash.finish();
+
+  // First-run and no-key notices come after the app is on screen, so they
+  // never compete with the splash.
   await showFirstRunDialog();
 
   // Warn (once) if no API key is configured yet — but not for LM Studio, which
@@ -380,8 +423,6 @@ async function boot() {
   if (!hasKey && (bootSettings.provider || 'mistral') !== 'lmstudio') {
     setTimeout(() => toast(t('No API key set — open Settings to connect to Mistral.', locale), 'info', 6000), 600);
   }
-
-  navigate('chat');
 }
 
 boot();

@@ -11,6 +11,7 @@ const skills = require('./skills');
 const extract = require('./extract');
 const plugins = require('./plugins');
 const { createConsoleManager } = require('./consoles');
+const { initAutoUpdater, checkForUpdatesManually } = require('./updater');
 
 const isDev = process.argv.includes('--dev');
 
@@ -310,9 +311,18 @@ function createWindow() {
   mainWindow.on('unmaximize', () => mainWindow.webContents.send('window:maximized', false));
 
   // Open external links in the system browser, never in-app.
+  // `setWindowOpenHandler` covers window.open / target=_blank; `will-navigate`
+  // covers ordinary <a href> clicks, which would otherwise replace the app UI
+  // with the remote page.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: 'deny' };
+  });
+  mainWindow.webContents.on('will-navigate', (e, url) => {
+    if (/^https?:|^mailto:/i.test(url)) {
+      e.preventDefault();
+      shell.openExternal(url);
+    }
   });
 
   mainWindow.on('closed', () => {
@@ -557,6 +567,10 @@ ipcMain.on('window:maximize', () => {
 ipcMain.on('window:close', () => mainWindow?.close());
 ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false);
 
+/* ---- app / updates ---- */
+ipcMain.handle('app:version', () => app.getVersion());
+ipcMain.handle('updates:check', () => checkForUpdatesManually());
+
 /* ------------------------------------------------------------------ *
  *  IPC: Mistral API
  *  Streaming uses fire-and-forget `send` + push events on 'mistral:stream'.
@@ -714,6 +728,7 @@ function sessionToMarkdown(session) {
 app.whenReady().then(() => {
   createWindow();
   pluginManager.initAutostart(); // bring back up any plugin the user had enabled
+  initAutoUpdater(() => mainWindow); // check GitHub Releases for a newer version
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

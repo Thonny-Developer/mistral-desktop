@@ -46,11 +46,13 @@ module.exports = {
   portable: {
     artifactName: "${productName}-${version}-portable.${ext}"
   },
-  // Auto-updater target. Stubbed here — fill in a real provider when publishing.
-  // publish: [
-  //   {
-  //     provider: "generic",
-  //     url: "https://example.com/mistral-cli/updates/"
-  //   }
-  // ]
+  // Auto-updater target: GitHub Releases. electron-updater reads latest.yml /
+  // latest-linux.yml from the release matching owner/repo below.
+  publish: [
+    {
+      provider: "github",
+      owner: "Thonny-Developer",
+      repo: "mistral-desktop"
+    }
+  ]
 };

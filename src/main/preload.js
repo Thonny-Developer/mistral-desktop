@@ -128,5 +128,13 @@ contextBridge.exposeInMainWorld('api', {
   /* ---- export ---- */
   session: {
     export: (session, format) => ipcRenderer.invoke('session:export', { session, format })
+  },
+
+  /* ---- app info + auto-update ---- */
+  app: {
+    version: () => ipcRenderer.invoke('app:version')
+  },
+  updates: {
+    check: () => ipcRenderer.invoke('updates:check')
   }
 });

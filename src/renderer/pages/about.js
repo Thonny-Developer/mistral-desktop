@@ -5,7 +5,7 @@ import { MODEL_INFO } from '../models.js';
 
 const api = window.api;
 
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.4.1'; // fallback only — real version comes from api.app.version()
 
 const SHORTCUTS = [
   ['New chat', 'Ctrl+N'],
@@ -25,8 +25,10 @@ const LINKS = [
 
 async function render(container) {
   const settings = await getSettings();
+  const ru = (settings.locale || 'ru') === 'ru';
   const model = settings.model || 'mistral-large-latest';
   const info = MODEL_INFO[model] || { context: '32k context', caps: [] };
+  const version = await getVersion();
 
   container.innerHTML = `
     <div class="about scroll">
@@ -34,7 +36,7 @@ async function render(container) {
         <div class="about-id">
           <div>
             <div class="name">Mistral Desktop</div>
-            <div class="ver mono">v${APP_VERSION} · electron</div>
+            <div class="ver mono">v${version} · electron</div>
           </div>
         </div>
         <hr class="hr" style="margin:24px 0" />
@@ -42,6 +44,14 @@ async function render(container) {
         <div class="about-block">
           <span class="lbl">API status</span>
           <div id="apiStatus"><span class="streaming"><span class="pulse"></span>checking…</span></div>
+        </div>
+
+        <div class="about-block">
+          <span class="lbl">${ru ? 'Обновления' : 'Updates'}</span>
+          <div class="row" style="gap:12px;align-items:center">
+            <button class="btn ghost sm" id="checkUpdates">${ru ? 'Проверить обновления' : 'Check for updates'}</button>
+            <span id="updateStatus" class="mono txt-d" style="font-size:11px"></span>
+          </div>
         </div>
 
         <div class="about-block">
@@ -68,6 +78,40 @@ async function render(container) {
 
   // Live ping (best-effort).
   pingStatus(container, settings);
+  wireUpdates(container, ru);
+}
+
+async function getVersion() {
+  try { return (await api.app?.version?.()) || APP_VERSION; } catch { return APP_VERSION; }
+}
+
+/** Wire the "Check for updates" button to the main-process updater. */
+function wireUpdates(container, ru) {
+  const btn = container.querySelector('#checkUpdates');
+  const status = container.querySelector('#updateStatus');
+  if (!btn || !status || !api.updates) return;
+
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    status.textContent = ru ? 'Проверка…' : 'Checking…';
+    try {
+      status.textContent = updateMessage(await api.updates.check(), ru);
+    } catch {
+      status.textContent = ru ? 'Не удалось проверить' : 'Check failed';
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+function updateMessage(res, ru) {
+  switch (res && res.status) {
+    case 'available': return ru ? `Доступна версия ${res.version} — начинаю загрузку` : `Version ${res.version} available — downloading`;
+    case 'latest':    return ru ? `У вас последняя версия (v${res.version})` : `You're up to date (v${res.version})`;
+    case 'dev':       return ru ? 'Доступно только в установленной версии' : 'Only available in the installed app';
+    case 'error':     return ru ? 'Не удалось проверить обновления' : 'Could not check for updates';
+    default:          return '';
+  }
 }
 
 async function pingStatus(container, settings) {

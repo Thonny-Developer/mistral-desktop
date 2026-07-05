@@ -337,3 +337,113 @@ hr.hr { height: 1px; background: var(--line); border: 0; margin: 0; }
 
 /* focus ring for keyboard users */
 :focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+
+/* ============================================================
+   Boot splash — a single flat fill in the user's theme color,
+   shown over the app while it checks for updates and builds the
+   UI. Driven by splash.js; removed from the DOM once ready.
+   ============================================================ */
+.splash {
+  position: fixed;
+  inset: 0;
+  z-index: 300; /* above modals/toasts; gone before any of them show */
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  transition: opacity .45s ease;
+}
+.splash.leaving { opacity: 0; pointer-events: none; }
+
+.splash-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  /* sit a touch above the optical center */
+  transform: translateY(-3%);
+  animation: splashStageIn .55s cubic-bezier(.2, .7, .2, 1) both;
+}
+@keyframes splashStageIn {
+  from { opacity: 0; transform: translateY(-3%) scale(.97); }
+  to   { opacity: 1; transform: translateY(-3%) scale(1); }
+}
+
+.splash-mark {
+  font-size: 56px;
+  line-height: 1;
+  color: var(--accent);
+  filter: drop-shadow(0 0 18px color-mix(in srgb, var(--accent) 45%, transparent));
+  animation: splashPulse 1.9s ease-in-out infinite;
+}
+@keyframes splashPulse {
+  0%, 100% { opacity: .82; transform: scale(1); }
+  50%      { opacity: 1;   transform: scale(1.09); }
+}
+
+.splash-brand {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .26em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-top: 2px;
+}
+
+.splash-status {
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: .01em;
+  color: var(--ink);
+  min-height: 1.3em;
+  text-align: center;
+  transition: opacity .17s ease, transform .17s ease;
+}
+.splash-status.swap { opacity: 0; transform: translateY(4px); }
+
+.splash-track {
+  position: relative;
+  width: 196px;
+  height: 2px;
+  margin-top: 4px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+.splash-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width .5s cubic-bezier(.4, 0, .2, 1);
+}
+/* a slow shimmer sweep so the bar reads as "working" even between phases */
+.splash-track::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg,
+    transparent,
+    color-mix(in srgb, var(--accent) 32%, transparent),
+    transparent);
+  transform: translateX(-100%);
+  animation: splashShimmer 1.5s ease-in-out infinite;
+}
+@keyframes splashShimmer { to { transform: translateX(196px); } }
+
+/* App entrance: hidden under the splash during boot, then animated in as the
+   splash fades out (splash.js swaps pre-boot → booted on finish). */
+.app.pre-boot { opacity: 0; }
+.app.booted { animation: appReveal .6s cubic-bezier(.2, .7, .2, 1) both; }
+@keyframes appReveal {
+  from { opacity: 0; transform: translateY(8px) scale(.992); }
+  to   { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .splash-mark,
+  .splash-track::after,
+  .splash-stage { animation: none; }
+  .app.booted { animation-duration: .01ms; }
+}

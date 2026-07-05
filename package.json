@@ -7,10 +7,10 @@
     "name": "thonny_dev",
     "email": "thonnydev@gmail.com"
   },
-  "homepage": "https://github.com/Thonny-Developer/mist-desktop",
+  "homepage": "https://github.com/Thonny-Developer/mistral-desktop",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Thonny-Developer/mist-desktop.git"
+    "url": "https://github.com/Thonny-Developer/mistral-desktop.git"
   },
   "license": "MIT",
   "main": "src/main/main.js",
