@@ -348,18 +348,10 @@ async function drawOutput(pane, settings) {
         <div class="setlbl"><div class="l1">${t('Render markdown', locale)}</div></div>
         <div class="toggle ${settings.renderMarkdown ? 'on' : ''}" id="tgMd"></div>
       </div>
-      <div class="setrow">
-        <div class="setlbl"><div class="l1">${t('Output format', locale)}</div></div>
-        <div class="seg-group" id="fmt">
-          ${['markdown', 'plain', 'json'].map((f) =>
-            `<button class="seg ${settings.outputFormat === f ? 'active' : ''}" data-v="${f}">${t(f, locale)}</button>`).join('')}
-        </div>
-      </div>
     </div>`;
 
   bindToggle(pane.querySelector('#tgStream'), settings.stream, (v) => saveSettings({ stream: v }));
   bindToggle(pane.querySelector('#tgMd'), settings.renderMarkdown, (v) => saveSettings({ renderMarkdown: v }));
-  bindSeg(pane.querySelector('#fmt'), (v) => saveSettings({ outputFormat: v }));
 }
 
 /* ---------------- Memory section ---------------- */

@@ -36,7 +36,6 @@ const store = new Store({
       maxTokens: 0, // 0 = unlimited
       stream: true,
       renderMarkdown: true,
-      outputFormat: 'markdown',
       theme: 'dark',
       fontSize: 14,
       collapseSidebar: false,
