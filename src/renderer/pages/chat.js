@@ -724,9 +724,15 @@ async function render(container, ctx) {
         return;
       }
       if (e.key === 'Enter' && !e.shiftKey && composer.value.startsWith('/') && !composer.value.includes(' ')) {
-        e.preventDefault();
-        applySlashSelection();
-        return;
+        // A fully typed command name is submitted on Enter; a partial one is
+        // completed to the highlighted suggestion first.
+        const typed = composer.value.toLowerCase();
+        const exact = allSlashCommands().some((c) => c.name.toLowerCase() === typed);
+        if (!exact) {
+          e.preventDefault();
+          applySlashSelection();
+          return;
+        }
       }
     }
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
@@ -806,6 +812,9 @@ async function render(container, ctx) {
     if (text.startsWith('/') && !imgs.length && !docs.length) {
       const handled = await handleSlashCommand(text);
       if (handled) {
+        composer.value = '';
+        composer.style.height = 'auto';
+        updateTokens();
         closeSlashSuggestions();
         return;
       }
