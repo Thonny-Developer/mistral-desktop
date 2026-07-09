@@ -75,6 +75,10 @@ let convo = freshConvo('mistral-large-latest');
 let streaming = false;
 let unsubStream = null;
 let autoScroll = true;
+/* Developer mode: read fresh on each render/send. When on, every user message
+ * carries a terminal button that opens the exact payload sent to the API. */
+let devMode = false;
+let peekFormat = 'pretty'; // dev inspector view: 'pretty' | 'json'
 
 function freshConvo(model) {
   return { id: uid(), title: '', model, createdAt: Date.now(), messages: [], savedId: null, workingDir: '', todos: [] };
@@ -218,6 +222,8 @@ async function persistConvo() {
 /* ---------------- render ---------------- */
 async function render(container, ctx) {
   const settings = await getSettings();
+  devMode = !!settings.devMode;
+  peekFormat = settings.devPeekFormat === 'json' ? 'json' : 'pretty';
   convo.model = settings.model || convo.model;
   await loadSkillCommands(); // populate the slash menu with available skills
 
@@ -296,6 +302,14 @@ async function render(container, ctx) {
 
   // refs
   const thread = container.querySelector('#thread');
+  // Dev inspector: the terminal button lives inside repainted message rows, so
+  // open the peek via delegation on the stable thread container.
+  thread.addEventListener('click', (e) => {
+    const btn = e.target.closest('.dev-peek');
+    if (!btn) return;
+    const msg = convo.messages[parseInt(btn.dataset.idx, 10)];
+    if (msg && msg.request) openDevPeek(btn, msg.request);
+  });
   const composer = container.querySelector('#composer');
   const sendBtn = container.querySelector('#sendBtn');
   const stopBtn = container.querySelector('#stopBtn');
@@ -822,6 +836,7 @@ async function render(container, ctx) {
 
     lastUserMessage = text; // save for error recovery
     const settings = await getSettings();
+    devMode = !!settings.devMode; // pick up a mid-session toggle before this send
     convo.model = settings.model || convo.model;
 
     // Warn (don't block) if images are attached but the model can't see them.

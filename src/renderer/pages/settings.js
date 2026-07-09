@@ -348,10 +348,18 @@ async function drawOutput(pane, settings) {
         <div class="setlbl"><div class="l1">${t('Render markdown', locale)}</div></div>
         <div class="toggle ${settings.renderMarkdown ? 'on' : ''}" id="tgMd"></div>
       </div>
+      <div class="setrow">
+        <div class="setlbl">
+          <div class="l1">Режим разработчика</div>
+          <div class="l2">Возле каждого вашего сообщения появляется кнопка с терминалом — открывает всё, что реально ушло в API на этом запросе.</div>
+        </div>
+        <div class="toggle ${settings.devMode ? 'on' : ''}" id="tgDev"></div>
+      </div>
     </div>`;
 
   bindToggle(pane.querySelector('#tgStream'), settings.stream, (v) => saveSettings({ stream: v }));
   bindToggle(pane.querySelector('#tgMd'), settings.renderMarkdown, (v) => saveSettings({ renderMarkdown: v }));
+  bindToggle(pane.querySelector('#tgDev'), settings.devMode, (v) => saveSettings({ devMode: v }));
 }
 
 /* ---------------- Memory section ---------------- */

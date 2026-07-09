@@ -50,6 +50,36 @@ function pruneForSend(work) {
 }
 
 /**
+ * Deep-clone a request body for the developer inspector, replacing bulky
+ * base64 image payloads with a short placeholder so the snapshot stays readable
+ * and light to store — everything else (system prompt, tools, params) is kept
+ * verbatim.
+ */
+function sanitizeRequestBody(body) {
+  const shrinkUrl = (u) => {
+    if (typeof u === 'string' && /^data:/.test(u) && u.length > 96) {
+      const kb = Math.round(u.length / 1024);
+      return `${u.slice(0, u.indexOf(',') + 1)}…[${kb} КБ base64 обрезано]`;
+    }
+    return u;
+  };
+  const walk = (v) => {
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === 'object') {
+      const out = {};
+      for (const [k, val] of Object.entries(v)) {
+        if (k === 'image_url') out[k] = typeof val === 'string' ? shrinkUrl(val) : walk(val);
+        else if (k === 'url') out[k] = shrinkUrl(val);
+        else out[k] = walk(val);
+      }
+      return out;
+    }
+    return v;
+  };
+  try { return walk(body); } catch { return body; }
+}
+
+/**
  * Run the loop.
  * @param {Object}   o
  * @param {Array}    o.baseMessages    Full message array (incl. system prompts).
@@ -144,6 +174,7 @@ async function run({ baseMessages, settings, apiKey, signal, emit, requestApprov
 
   let planningDone = false;
   let requestedPlanning = false;
+  let requestReported = false; // dev inspector: only snapshot the turn's first API call
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     let text = '';
@@ -156,6 +187,12 @@ async function run({ baseMessages, settings, apiKey, signal, emit, requestApprov
         signal,
         tools: toolSchemas,
         onToken: (delta) => { text += delta; emit({ type: 'token', delta }); },
+        // Dev inspector: capture the exact payload of this user turn's first call.
+        onRequest: (body) => {
+          if (requestReported) return;
+          requestReported = true;
+          emit({ type: 'request', body: sanitizeRequestBody(body) });
+        },
         // Rate limited → tell the UI we're waiting and will retry (no rollback).
         onRetry: (info) => emit({ type: 'rate-limit-wait', ...info }),
         // Local model loading into memory → surface the staged wait to the UI.

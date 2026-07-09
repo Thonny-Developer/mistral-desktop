@@ -426,7 +426,7 @@ async function requestWithRetries({ endpoint, path, apiKey, body, signal, stream
  * @param {Array}    opts.tools          Optional tool/function schemas for native tool-calling.
  * @returns {Promise<{content:string, toolCalls:Array, usage:Object|null}>}
  */
-async function sendMessage({ messages, settings, apiKey, onToken, signal, tools, onRetry, onLoading, responseFormat }) {
+async function sendMessage({ messages, settings, apiKey, onToken, signal, tools, onRetry, onLoading, responseFormat, onRequest }) {
   const prov = providerConfig(settings);
   if (prov.requiresKey && !apiKey) throw apiError('No API key configured. Add one in Settings.', 'auth');
 
@@ -476,6 +476,11 @@ async function sendMessage({ messages, settings, apiKey, onToken, signal, tools,
   }
   // Structured outputs: pin the reply to a JSON schema when the caller asks.
   if (responseFormat) body.response_format = responseFormat;
+
+  // Developer inspector: hand the fully-assembled request body to the caller
+  // (the exact payload about to hit /chat/completions, minus the API key which
+  // travels in the Authorization header, never the body).
+  if (onRequest) { try { onRequest(body); } catch { /* inspector must never break a request */ } }
 
   // Rate limits and transient blips (network drop / 5xx) are retried inside the
   // helper without rolling the turn back — nothing has streamed yet, so it is

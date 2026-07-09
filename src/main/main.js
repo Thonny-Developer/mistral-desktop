@@ -43,6 +43,8 @@ const store = new Store({
       aiPermissionMode: 'default',
       activePresetId: 'general',
       locale: 'ru',
+      devMode: false,            // developer mode: per-message "what went to the API" inspector
+      devPeekFormat: 'pretty',   // inspector view: 'pretty' | 'json'
       // Proactive rate limiter (see mistral.js rateGate): cap simultaneous
       // requests and space their starts so bursts glide under Mistral's limit
       // instead of tripping 429s. Defaults suit the free tier (serialise, no
