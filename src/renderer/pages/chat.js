@@ -981,6 +981,15 @@ async function render(container, ctx) {
     unsubStream = api.mistral.onStream((msg) => {
       // Local model load progress — render it and wait for real output.
       if (msg.type === 'model-loading') { showModelLoading(msg); return; }
+      // Dev inspector: the exact payload sent to the API for this user turn.
+      // Attach it to the user message and, in dev mode, drop the terminal button
+      // into the already-painted user row without disturbing the live stream.
+      if (msg.type === 'request') {
+        userMsg.request = msg.body;
+        persistConvo();
+        if (devMode) injectDevPeek(thread, convo.messages.indexOf(userMsg));
+        return;
+      }
       // Anything else means output (or an end state) has begun → drop the loader.
       if (loadingTimer) hideModelLoading();
       if (msg.type === 'token') {
@@ -1216,12 +1225,13 @@ function paintThread(thread, streamingLast = false) {
   }
   thread.innerHTML = convo.messages.map((m, i) => {
     if (m.role === 'user') {
+      const peek = devMode && m.request ? devPeekButton(i) : '';
       // Skill invocation: fold the full playbook into a compact pill.
       if (m.skillInvoke) {
         const argHtml = m.skillInvoke.arg
           ? ` <span class="skill-invoke-arg">${escapeHtml(m.skillInvoke.arg)}</span>`
           : '';
-        return `<div class="msg-row user"><div class="skill-invoke">✦ Скилл <b>/${escapeHtml(m.skillInvoke.name)}</b>${argHtml}</div></div>`;
+        return `<div class="msg-row user">${peek}<div class="skill-invoke">✦ Скилл <b>/${escapeHtml(m.skillInvoke.name)}</b>${argHtml}</div></div>`;
       }
       const utext = contentText(m.content);
       const uimgs = contentImages(m.content);
@@ -1232,7 +1242,7 @@ function paintThread(thread, streamingLast = false) {
         ? `<div class="bubble-docs">${m.docs.map((d) =>
             `<span class="bubble-doc"><span class="bubble-doc-ext">${escapeHtml((d.ext || 'file').toUpperCase())}</span>${escapeHtml(d.name)}</span>`).join('')}</div>`
         : '';
-      return `<div class="msg-row user"><div class="bubble user">${imgsHtml}${docsHtml}${utext ? escapeHtml(utext) : ''}</div></div>`;
+      return `<div class="msg-row user">${peek}<div class="bubble user">${imgsHtml}${docsHtml}${utext ? escapeHtml(utext) : ''}</div></div>`;
     }
     const isLast = i === convo.messages.length - 1;
     const cursor = streamingLast && isLast ? '<span class="stream-cursor">▏</span>' : '';
@@ -1631,12 +1641,154 @@ function toggleCtxPopover(container, b, limit) {
   setTimeout(() => document.addEventListener('click', onDocClickCtx), 0);
 }
 
+/* ---------------- developer inspector (dev mode) ---------------- */
+const TERM_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M4.5 6.3 6.6 8.4 4.5 10.5"/><path d="M8 10.5h3.6"/></svg>';
+const COPY_SVG = '<svg viewBox="0 0 16 16"><rect x="5" y="5" width="8.5" height="8.5" rx="1.5"/><path d="M3 10.3V3.5a1 1 0 0 1 1-1h6.8"/></svg>';
+
+/** Terminal button that opens the "what went to the API" inspector. */
+function devPeekButton(i) {
+  return `<button class="dev-peek" data-idx="${i}" title="Что ушло в API">${TERM_SVG}</button>`;
+}
+
+/** Insert the terminal button into an already-painted user row (mid-stream),
+ *  without repainting the thread and killing the live view. */
+function injectDevPeek(thread, idx) {
+  if (idx < 0) return;
+  const row = thread.children[idx];
+  if (!row || !row.classList.contains('user') || row.querySelector('.dev-peek')) return;
+  row.insertAdjacentHTML('afterbegin', devPeekButton(idx));
+}
+
+let devPeekPop = null;
+function closeDevPeek() {
+  devPeekPop?.remove();
+  devPeekPop = null;
+  document.removeEventListener('click', onDocClickPeek);
+}
+function onDocClickPeek(e) {
+  if (!e.target.closest('.dev-peek-pop') && !e.target.closest('.dev-peek')) closeDevPeek();
+}
+
+/** Open the request inspector anchored to `anchor`, opening to its left. */
+function openDevPeek(anchor, body) {
+  const same = devPeekPop && devPeekPop._anchor === anchor;
+  if (devPeekPop) closeDevPeek();
+  if (same) return; // clicking the same button toggles it closed
+
+  devPeekPop = document.createElement('div');
+  devPeekPop.className = 'dev-peek-pop';
+  devPeekPop._anchor = anchor;
+  devPeekPop.innerHTML = `
+    <div class="peek-head">
+      <span class="lbl">Запрос к API</span>
+      <div class="seg-group peek-fmt">
+        <button class="seg ${peekFormat === 'pretty' ? 'active' : ''}" data-fmt="pretty">Красиво</button>
+        <button class="seg ${peekFormat === 'json' ? 'active' : ''}" data-fmt="json">JSON</button>
+      </div>
+      <button class="peek-copy icon-btn" title="Скопировать JSON">${COPY_SVG}</button>
+    </div>
+    <div class="peek-body"></div>`;
+  document.getElementById('overlayHost').appendChild(devPeekPop);
+
+  const bodyEl = devPeekPop.querySelector('.peek-body');
+  const paint = () => { bodyEl.innerHTML = peekFormat === 'json' ? renderPeekJson(body) : renderPeekPretty(body); };
+  paint();
+
+  devPeekPop.querySelectorAll('.peek-fmt .seg').forEach((seg) =>
+    seg.addEventListener('click', () => {
+      peekFormat = seg.dataset.fmt === 'json' ? 'json' : 'pretty';
+      saveSettings({ devPeekFormat: peekFormat });
+      devPeekPop.querySelectorAll('.peek-fmt .seg').forEach((s) => s.classList.toggle('active', s === seg));
+      paint();
+    }));
+  devPeekPop.querySelector('.peek-copy').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(JSON.stringify(body, null, 2)); toast('Скопировано', 'success', 1400); }
+    catch { toast('Не удалось скопировать', 'error'); }
+  });
+
+  // Position to the LEFT of the button, clamped to the viewport.
+  const r = anchor.getBoundingClientRect();
+  const w = devPeekPop.offsetWidth;
+  let left = r.left - 8 - w;
+  if (left < 8) left = 8;
+  devPeekPop.style.left = `${left}px`;
+  const top = Math.max(8, Math.min(r.top, window.innerHeight - devPeekPop.offsetHeight - 8));
+  devPeekPop.style.top = `${top}px`;
+
+  setTimeout(() => document.addEventListener('click', onDocClickPeek), 0);
+}
+
+/** Human-readable request breakdown: params, tool list, and the message array. */
+function renderPeekPretty(body) {
+  const rows = [];
+  const add = (k, v) => { if (v !== undefined && v !== null && v !== '') rows.push([k, v]); };
+  add('model', body.model);
+  add('temperature', body.temperature);
+  add('top_p', body.top_p);
+  add('max_tokens', body.max_tokens);
+  add('stream', String(body.stream));
+  add('tool_choice', body.tool_choice);
+  add('prompt_cache_key', body.prompt_cache_key);
+  if (body.response_format) add('response_format', body.response_format.type || 'json_schema');
+  const params = rows.map(([k, v]) =>
+    `<div class="peek-kv"><span class="k mono">${escapeHtml(k)}</span><span class="v mono">${escapeHtml(String(v))}</span></div>`).join('');
+
+  const toolNames = (body.tools || []).map((t) => t.function?.name).filter(Boolean);
+  const msgs = (body.messages || []).map((m) => {
+    const meta = [];
+    if (m.name) meta.push(m.name);
+    if (m.tool_call_id) meta.push(m.tool_call_id);
+    const calls = (m.tool_calls || []).map((tc) =>
+      `<div class="peek-toolcall mono">→ ${escapeHtml(tc.function?.name || '?')}(${escapeHtml(tc.function?.arguments || '')})</div>`).join('');
+    return `
+      <div class="peek-msg peek-role-${escapeHtml(m.role)}">
+        <div class="peek-msg-head">
+          <span class="peek-role">${escapeHtml(m.role)}</span>
+          ${meta.length ? `<span class="peek-meta mono">${escapeHtml(meta.join(' · '))}</span>` : ''}
+        </div>
+        ${m.content ? peekContent(m.content) : ''}
+        ${calls}
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="peek-sec-title">Параметры</div>
+    <div class="peek-params">${params}</div>
+    ${toolNames.length ? `
+      <div class="peek-sec-title">Инструменты · ${toolNames.length}</div>
+      <div class="peek-tools mono">${toolNames.map((n) => escapeHtml(n)).join(', ')}</div>` : ''}
+    <div class="peek-sec-title">Сообщения · ${(body.messages || []).length}</div>
+    ${msgs}`;
+}
+
+/** Render one message's content (string or vision parts array). */
+function peekContent(content) {
+  if (typeof content === 'string') return `<pre class="peek-pre">${escapeHtml(content)}</pre>`;
+  if (Array.isArray(content)) {
+    return content.map((p) => {
+      if (p.type === 'text') return `<pre class="peek-pre">${escapeHtml(p.text || '')}</pre>`;
+      if (p.type === 'image_url') {
+        const u = typeof p.image_url === 'string' ? p.image_url : (p.image_url?.url || '');
+        return `<div class="peek-img mono">🖼 ${escapeHtml(u)}</div>`;
+      }
+      return `<pre class="peek-pre">${escapeHtml(JSON.stringify(p))}</pre>`;
+    }).join('');
+  }
+  return `<pre class="peek-pre">${escapeHtml(JSON.stringify(content))}</pre>`;
+}
+
+/** Raw request body as pretty-printed JSON. */
+function renderPeekJson(body) {
+  return `<pre class="peek-pre peek-json">${escapeHtml(JSON.stringify(body, null, 2))}</pre>`;
+}
+
 /* ---------------- lifecycle ---------------- */
 function destroy() {
   if (chatPage._onKey) { document.removeEventListener('keydown', chatPage._onKey); chatPage._onKey = null; }
   closeTodosPopover();
   closeAiPermPopover();
   closeCtxPopover();
+  closeDevPeek();
   // Note: we intentionally keep an active stream alive so it survives a quick
   // page switch; the subscription closes itself on done/error.
 }

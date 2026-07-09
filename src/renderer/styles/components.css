@@ -427,11 +427,54 @@ select.field-box { appearance: none; cursor: pointer; background-image: none; }
 }
 .approval-card .approval-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
+/* developer inspector — terminal button + "what went to the API" popover */
+.dev-peek {
+  align-self: flex-start; flex: none; margin-top: 2px;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; border-radius: 7px;
+  border: 1px solid var(--line-2); background: var(--panel-2); color: var(--ink-3);
+  cursor: pointer; transition: color .12s, border-color .12s, background .12s;
+}
+.dev-peek:hover { color: var(--accent); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--panel-2)); }
+.dev-peek svg { width: 14px; height: 14px; }
+
+.dev-peek-pop {
+  position: fixed; width: 440px; max-width: calc(100vw - 32px); max-height: 74vh;
+  z-index: 130; display: flex; flex-direction: column;
+  background: var(--panel-2); border: 1px solid var(--line-strong); border-radius: 10px;
+  box-shadow: 0 20px 50px -18px rgba(0, 0, 0, .85); overflow: hidden; animation: paletteIn .12s ease;
+}
+.dev-peek-pop .peek-head { display: flex; align-items: center; gap: 10px; padding: 9px 11px; border-bottom: 1px solid var(--line); flex: none; }
+.dev-peek-pop .peek-head .lbl { font-weight: 600; font-size: 11px; color: var(--ink); }
+.dev-peek-pop .peek-fmt { margin-left: auto; gap: 6px; }
+.dev-peek-pop .peek-fmt .seg { padding: 4px 10px; font-size: 11px; }
+.dev-peek-pop .peek-copy { width: 28px; height: 26px; }
+.dev-peek-pop .peek-body { padding: 12px 14px; overflow-y: auto; }
+.peek-sec-title { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-4); margin: 16px 0 8px; }
+.peek-sec-title:first-child { margin-top: 0; }
+.peek-params { display: flex; flex-direction: column; gap: 2px; }
+.peek-kv { display: flex; justify-content: space-between; gap: 12px; font-size: 11.5px; padding: 2px 0; }
+.peek-kv .k { color: var(--ink-3); }
+.peek-kv .v { color: var(--ink); text-align: right; word-break: break-all; }
+.peek-tools { font-size: 11px; color: var(--ink-2); line-height: 1.6; word-break: break-word; }
+.peek-msg { border: 1px solid var(--line-2); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; background: var(--panel); }
+.peek-msg-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.peek-role { font-family: var(--mono); font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase; padding: 2px 7px; border-radius: 100px; background: var(--panel-3); color: var(--ink-2); }
+.peek-role-system .peek-role { color: #e0a800; }
+.peek-role-user .peek-role { color: var(--accent); }
+.peek-role-assistant .peek-role { color: var(--ink); }
+.peek-role-tool .peek-role { color: #4a9d7a; }
+.peek-meta { font-size: 10px; color: var(--ink-4); word-break: break-all; }
+.peek-pre { font-family: var(--mono); font-size: 11px; line-height: 1.5; color: var(--ink-2); white-space: pre-wrap; word-break: break-word; margin: 0; max-height: 260px; overflow-y: auto; }
+.peek-json { max-height: none; }
+.peek-img { font-size: 10.5px; color: var(--ink-3); padding: 3px 0; word-break: break-all; }
+.peek-toolcall { font-size: 10.5px; color: var(--ink-3); margin-top: 4px; word-break: break-word; }
+
 .thread { flex: 1; padding: 22px 20px; display: flex; flex-direction: column; gap: 22px; overflow-y: auto; }
 
 /* message bubbles */
 .msg-row { display: flex; }
-.msg-row.user { justify-content: flex-end; }
+.msg-row.user { justify-content: flex-end; align-items: flex-start; gap: 8px; }
 .bubble { border-radius: 8px; padding: 11px 13px; font-size: 12.5px; line-height: 1.55; max-width: 74%; }
 .bubble.user { background: var(--panel-3); border: 1px solid var(--line-2); color: var(--ink); white-space: pre-wrap; word-break: break-word; }
 
