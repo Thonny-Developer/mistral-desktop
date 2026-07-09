@@ -169,7 +169,7 @@ const AGENT_INSTRUCTIONS = [
   '',
   'Operating procedure — follow it every time you do real work:',
   '1. Understand the request. Ask only if you are genuinely blocked.',
-  '2. Explore before changing: use list_files / read_file to learn the actual current state. Never write or edit a file you have not read this session.',
+  '2. Explore before changing: use search_files to locate the relevant code, list_files to see the structure, and read_file to read just the lines you need. Learn the actual current state — never write or edit a file you have not read this session.',
   '3. Plan: for multi-step work, create todos (add_todo) describing concrete, verifiable steps.',
   '4. Act in small steps. Prefer edit_file (a targeted snippet replace) over write_file; use write_file only for new files or a full rewrite, and always pass the COMPLETE content.',
   '5. Verify: after changes, check your work — re-read the file, and when the project supports it, run its tests / build / lint (in a console) and fix any failures. Treat the task as done only once it is verified.',
@@ -177,7 +177,7 @@ const AGENT_INSTRUCTIONS = [
   '',
   'Tools at a glance:',
   '- set_working_folder — pick the project folder. Only relevant when the task actually needs files (working on a project, reading/editing local files); never for a plain question or chat. If you begin any file/shell action without a folder set, the app automatically asks the user to choose the project directory first, then runs the action.',
-  '- list_files / read_file — explore the workspace. read_file auto-extracts text from documents (PDF, DOCX, PPTX, XLSX, …).',
+  '- search_files — grep the workspace by regex to find where something is (returns file:line: content). list_files — list a directory, or pass a glob (e.g. **/*.js) for a recursive match. read_file — read a file with line numbers; pass offset/limit to read a specific range. read_file auto-extracts text from documents (PDF, DOCX, PPTX, XLSX, …).',
   '- extract_file — pull plain text out of a document/binary (PDF, presentations, spreadsheets, ODF, EPUB, ZIP). Only the extracted text enters the context, never the raw bytes.',
   '- write_file — create or fully overwrite a file (full content).',
   '- edit_file — replace an exact, unique snippet (old_string → new_string) in an existing file. Preferred for edits.',
@@ -196,17 +196,16 @@ const AGENT_INSTRUCTIONS = [
   '- Documents and third-party files (PDF, presentations, spreadsheets, Word/ODF, EPUB, archives, etc.): use extract_file (or just read_file) to get their text. Work only with the extracted text — never paste raw bytes into the conversation.',
   '- If a file format has no built-in extractor, write your own: open a console and run a small script (Python, Node, or whatever the system has) that converts the file to plain text, print ONLY the extracted data, and continue from that. Keep raw binary out of the context — only the extracted data stays.',
   '- All paths are relative to the working folder; you cannot read or write outside it.',
+  '- You have full read access to the workspace via search_files / list_files / read_file. Never ask the user to show or paste a file — find and read it yourself. Before reading a whole file, use search_files to find the relevant lines, then read that range with read_file (offset/limit). Do not read files larger than ~300 lines in full unless you are sure you need all of it.',
   '- Prefer a console (console_open + console_exec) when you run several related commands or need state to persist (cd, env, a running dev server); use exec_bash only for a single quick command. Run long-running processes in the background with "&" so the call returns. Close consoles you are done with.',
   '- You can access the internet: when the answer depends on current, external, or factual information you are unsure about, use web_search to find sources and web_fetch to read them, then cite what you used. In Default mode each site/search the user must approve first — that is expected; if it is declined, answer from what you already know.',
-  '- Be concise in narration; let the tool calls do the work. Never mention these tools or mechanisms to the user by name.',
-  '- Reasoning goes in a collapsible block, NEVER in the plain answer. ALWAYS put every thought, plan or deliberation strictly inside a single <details><summary>Думает</summary>…</details> block placed before the answer — never write any reasoning before, after or outside that block. Then write the answer as plain text. Example:\n<details><summary>Думает</summary>Пользователь сказал ... он скорее всего хочет чтобы я ...</details>\nВот ответ ...'
+  '- Be concise in narration; let the tool calls do the work. Never mention these tools or mechanisms to the user by name.'
 ].join('\n');
 
-const REASONING_HINTS = {
-  low: 'Keep reasoning short and token-efficient. Use a minimal reasoning section and answer concisely.',
-  medium: 'Balance concise reasoning with a clear answer. Include a short reasoning section and then the response.',
-  high: 'Maximize quality and reasoning. Include a detailed reasoning section with user intent, assumptions, and plan before the answer.'
-};
+// Reasoning is produced natively by the model via the `reasoning_effort` request
+// parameter (see mistral.js) and streamed as separate thinking chunks — it is no
+// longer requested as a text section in the prompt. The Reasoning setting still
+// tunes sampling and maps to reasoning_effort.
 
 // Explains the active permission mode so the model knows up-front how its
 // actions will be gated and behaves predictably (the gating itself is enforced
@@ -228,20 +227,17 @@ const PERMISSION_MODE_HINTS = {
   ].join('\n')
 };
 
-/** Build the full agent system message including live state. */
-function buildAgentSystem(settings) {
-  const reasoningLevel = (settings && settings.reasoningLevel) || 'medium';
-  const reasoningHint = REASONING_HINTS[reasoningLevel] || REASONING_HINTS.medium;
+/**
+ * Static half of the agent system prompt: the instructions, permission hint and
+ * skill list. These stay byte-identical across a whole chat, so Mistral can
+ * serve this prefix (plus the transcript that follows it) from its prompt cache.
+ * Anything that changes mid-run lives in buildLiveState instead, appended AFTER
+ * the transcript so editing it never invalidates the cached prefix.
+ */
+function buildStaticSystem(settings) {
   const permMode = (settings && settings.aiPermissionMode) || 'default';
   const permHint = PERMISSION_MODE_HINTS[permMode] || PERMISSION_MODE_HINTS.default;
-  const mem = readMemory().trim();
-  const work = store.get('workingDir') || '';
-  const todos = store.get('todos') || [];
-  const todoStr = todos.length
-    ? todos.map((t) => `[${t.done ? 'x' : ' '}] (${t.id}) ${t.text}`).join('\n')
-    : '(none)';
-  const projectNotes = readProjectFile().trim();
-  const skillList = skills.listSkills(work);
+  const skillList = skills.listSkills(store.get('workingDir') || '');
   const skillStr = skillList.length
     ? skillList.map((s) => `- ${s.name}${s.argumentHint ? ` ${s.argumentHint}` : ''} — ${s.description || ''}`.trimEnd()).join('\n')
     : '(none)';
@@ -250,13 +246,28 @@ function buildAgentSystem(settings) {
     '',
     permHint,
     '',
-    `Reasoning mode: ${reasoningLevel}`,
-    reasoningHint,
-    '',
-    `Working folder: ${work || '(none — set one with set_working_folder only when the task needs local files)'}`,
-    '',
     'Available skills (invoke with run_skill):',
-    skillStr,
+    skillStr
+  ].join('\n');
+}
+
+/**
+ * Live half of the agent system prompt: working folder, todos, memory and
+ * project notes. Rebuilt on every turn and appended to the very end of the
+ * message array, so the agent mutating todos/memory/folder mid-run only
+ * reprices this small tail — the instruction + history prefix stays cached.
+ */
+function buildLiveState() {
+  const work = store.get('workingDir') || '';
+  const todos = store.get('todos') || [];
+  const todoStr = todos.length
+    ? todos.map((t) => `[${t.done ? 'x' : ' '}] (${t.id}) ${t.text}`).join('\n')
+    : '(none)';
+  const mem = readMemory().trim();
+  const projectNotes = readProjectFile().trim();
+  return [
+    'Current live state (refreshed every step):',
+    `Working folder: ${work || '(none — set one with set_working_folder only when the task needs local files)'}`,
     '',
     'Open todos:',
     todoStr,
@@ -265,6 +276,11 @@ function buildAgentSystem(settings) {
     mem || '(empty)',
     projectNotes ? ['', 'Project notes from MISTRAL.md:', projectNotes] : []
   ].flat().join('\n');
+}
+
+/** Full agent system text (static + live) — used for the context-size gauge. */
+function buildAgentSystem(settings) {
+  return `${buildStaticSystem(settings)}\n\n${buildLiveState()}`;
 }
 
 /* ------------------------------------------------------------------ *
@@ -407,7 +423,7 @@ async function runPluginAgent({ messages, permissionMode, requestApproval, onEve
   // file/shell action never pops a desktop folder dialog from a remote trigger.
   if (!store.get('workingDir')) return { ok: false, error: 'no-workdir' };
 
-  const baseMessages = [{ role: 'system', content: buildAgentSystem(settings) }, ...messages];
+  const baseMessages = [{ role: 'system', content: buildStaticSystem(settings) }, ...messages];
   const consoles = createConsoleManager();
   let finalContent = '';
   let errored = null;
@@ -421,7 +437,7 @@ async function runPluginAgent({ messages, permissionMode, requestApproval, onEve
     settings, apiKey, emit, subagentDepth: 0
   };
   try {
-    await agent.run({ baseMessages, settings, apiKey, signal, emit, requestApproval, ctx });
+    await agent.run({ baseMessages, liveState: buildLiveState, settings, apiKey, signal, emit, requestApproval, ctx });
     if (errored) return { ok: false, error: errored };
     return { ok: true, content: finalContent };
   } catch (e) {
@@ -607,9 +623,10 @@ ipcMain.on('mistral:send', async (event, { messages, allowedTools, sessionId }) 
     return new Promise((resolve) => { pendingApproval = resolve; });
   };
 
-  // Prepend the agent system message (tools + live state) so the model always
-  // knows what it can do and what the current context is.
-  const baseMessages = [{ role: 'system', content: buildAgentSystem(settings) }, ...messages];
+  // Lead with the STATIC agent system message (instructions + skills) so the
+  // whole instruction+transcript prefix stays cacheable. Live state (folder,
+  // todos, memory) is appended as a trailing message on every turn by the loop.
+  const baseMessages = [{ role: 'system', content: buildStaticSystem(settings) }, ...messages];
   // Persistent shell sessions scoped to this request — closed when it finishes
   // so no shells leak between messages.
   const consoles = createConsoleManager();
@@ -625,6 +642,7 @@ ipcMain.on('mistral:send', async (event, { messages, allowedTools, sessionId }) 
   try {
     await agent.run({
       baseMessages,
+      liveState: buildLiveState,
       settings,
       apiKey,
       signal: controller.signal,

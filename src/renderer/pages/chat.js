@@ -111,8 +111,19 @@ function contentImages(c) {
  * and any attached-document text is folded into the content so the model sees
  * it on every turn (the bubble itself only shows a file chip).
  */
-function apiMessage(m) {
-  const content = stripReasonMeta(m.content);
+function apiMessage(m, reasoningModel = false) {
+  let content = m.content;
+  // Assistant turns store their reasoning inside our <details> blocks. Replay it
+  // to reasoning-capable models as structured `thinking` chunks (Mistral degrades
+  // if the trace is dropped between turns); strip it to plain text for the rest.
+  if (m.role === 'assistant' && typeof content === 'string' && /<details\b/i.test(content)) {
+    const chunks = reasoningToChunks(content);
+    content = (reasoningModel && chunks.some((c) => c.type === 'thinking'))
+      ? chunks
+      : chunks.filter((c) => c.type === 'text').map((c) => c.text).join('\n\n');
+  } else {
+    content = stripReasonMeta(content);
+  }
   if (!m.docs || !m.docs.length) return { role: m.role, content };
   const blocks = m.docs.map((d) => `[Вложенный файл: ${d.name}]\n${d.text}`).join('\n\n');
   if (Array.isArray(content)) {
@@ -127,6 +138,46 @@ function apiMessage(m) {
 function stripReasonMeta(content) {
   if (typeof content !== 'string') return content;
   return content.replace(/<details\b[^>]*>/gi, '<details>');
+}
+
+/** Model families that emit native reasoning (thinking) chunks — small/medium via
+ *  reasoning_effort, magistral always. Only these get the reasoning trace replayed
+ *  as structured chunks; everything else receives the answer as plain text. */
+const REASONING_MODEL_RE = /^(mistral-(small|medium)|magistral)/i;
+function modelSupportsReasoning(model) {
+  return REASONING_MODEL_RE.test(model || '');
+}
+
+/**
+ * Turn a stored assistant string carrying reasoning `<details>` blocks into
+ * Mistral's structured content chunks: each block becomes a `thinking` chunk, the
+ * surrounding answer/tool text becomes `text` chunks, order preserved so an
+ * interleaved tool-loop turn (thinking → tool → thinking → answer) round-trips
+ * faithfully — which is what keeps the reasoning trace across turns.
+ * Robust to a truncated stream: an unclosed <details> (no matching </details>)
+ * treats the remainder as reasoning rather than dropping it; empty blocks and
+ * whitespace-only gaps produce no chunk.
+ * NOTE: mirrored by test/reasoning.test.mjs — keep the two in sync.
+ */
+function reasoningToChunks(text) {
+  const chunks = [];
+  const OPEN = /<details\b[^>]*>/i;
+  let rest = String(text);
+  while (true) {
+    const open = rest.match(OPEN);
+    if (!open) break;
+    const before = rest.slice(0, open.index);
+    if (before.trim()) chunks.push({ type: 'text', text: before });
+    const after = rest.slice(open.index + open[0].length);
+    const closeIdx = after.search(/<\/details>/i);
+    const inner = closeIdx === -1 ? after : after.slice(0, closeIdx);
+    const think = inner.replace(/<summary\b[^>]*>[\s\S]*?<\/summary>/i, '').trim();
+    if (think) chunks.push({ type: 'thinking', thinking: [{ type: 'text', text: think }] });
+    if (closeIdx === -1) { rest = ''; break; } // truncated: nothing valid left after
+    rest = after.slice(closeIdx + '</details>'.length);
+  }
+  if (rest.trim()) chunks.push({ type: 'text', text: rest });
+  return chunks;
 }
 
 /**
@@ -888,7 +939,8 @@ async function render(container, ctx) {
     // Send only what the API understands — strip UI-only metadata (skillUsed,
     // toolChars, imageTokens). content may be a string or a vision parts array;
     // attached-document text is folded into the content here.
-    outgoing.push(...convo.messages.map(apiMessage));
+    const reasoningModel = modelSupportsReasoning(settings.model);
+    outgoing.push(...convo.messages.map((m) => apiMessage(m, reasoningModel)));
 
     // Assistant placeholder. The agent loop streams multiple turns into this
     // one message: `committed` holds finalised visible text + tool lines from

@@ -322,7 +322,16 @@ export function stripAgentTags(text) {
     .replace(/<action>[\s\S]*?<\/action>/gi, '')
     .replace(/<action>[\s\S]*$/i, '')
     .replace(/<remember>[\s\S]*?<\/remember>/gi, '')
-    .replace(/<remember>[\s\S]*$/i, '');
+    .replace(/<remember>[\s\S]*$/i, '')
+    // A model/server can leak its tool-call format into the text instead of the
+    // structured tool_calls field. The main process recovers it into a real call
+    // (see recoverLeakedToolCalls); here we just make sure the raw remnant never
+    // renders. Tool calls always trail the turn, so we strip to the end. Covers
+    // "[TOOL_CALLS]…", a reasoning model's "startname{"…"}" DSL, and a
+    // detokenised "name<glyph>{json}" separator.
+    .replace(/\[TOOL_CALLS\][\s\S]*$/i, '')
+    .replace(/\bstart[A-Za-z_][\w-]*\s*\{\s*"[\s\S]*$/i, '')
+    .replace(/[A-Za-z_][\w-]*(?:\[ARGS\]|[^\x00-\x7F])\s*\{[\s\S]*$/, '');
 }
 
 // Regexes for pulling reasoning blocks out of the raw text before markdown

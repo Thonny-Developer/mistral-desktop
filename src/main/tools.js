@@ -20,8 +20,9 @@ const path = require('path');
 const { exec: execCommand } = require('child_process');
 const skills = require('./skills');
 const extract = require('./extract');
+const fileSearch = require('./fileSearch');
 
-const MAX_READ_BYTES = 20_000; // keep file reads from blowing the context window
+const MAX_READ_CHARS = 40_000; // guard against a pathological file (e.g. minified single line)
 const MAX_EXTRACT_CHARS = 40_000; // extracted document text is the payload, so allow more
 const IGNORE = new Set(['node_modules', '.git', '.DS_Store']);
 
@@ -59,6 +60,19 @@ async function pickFolder(ctx) {
 }
 
 async function listFiles(a, ctx) {
+  // Glob mode: recursive listing of files matching a pattern (e.g. "**/*.js").
+  if (a.glob) {
+    const files = await fileSearch.globFiles({ pattern: a.glob, path: a.path || '.' }, ctx.store.get('workingDir'));
+    const truncated = files.length > 300;
+    const shown = truncated ? files.slice(0, 300) : files;
+    const note = truncated ? `\n…(${files.length} files matched — showing first 300; narrow the glob)` : '';
+    return {
+      ok: true,
+      summary: `glob ${a.glob} · ${files.length} file(s)`,
+      output: (shown.join('\n') || `(no files match ${a.glob})`) + note
+    };
+  }
+  // Directory mode: one level of entries.
   const abs = resolveInWork(ctx, a.path || '.');
   const entries = (await fsp.readdir(abs, { withFileTypes: true }))
     .filter((e) => !IGNORE.has(e.name))
@@ -71,6 +85,28 @@ async function listFiles(a, ctx) {
   };
 }
 
+// Grep across the workspace: find where something is before reading it, so the
+// agent pulls in only the lines it needs instead of whole files.
+async function searchFiles(a, ctx) {
+  if (!a.pattern) throw new Error('search_files requires "pattern".');
+  const { matches, truncated } = await fileSearch.searchFiles(a, ctx.store.get('workingDir'));
+  if (!matches.length) {
+    return { ok: true, summary: `поиск · ${a.pattern} (0)`, output: `Совпадений по /${a.pattern}/ не найдено. Попробуйте другой паттерн, path или glob.` };
+  }
+  const body = matches.map((m) => {
+    const c = m.content.length > 300 ? m.content.slice(0, 300) + '…' : m.content;
+    return `${m.file}:${m.line}: ${c.trimEnd()}`;
+  }).join('\n');
+  const note = truncated
+    ? `\n…(результатов больше ${matches.length} — вывод обрезан; уточните паттерн, чтобы сузить поиск.)`
+    : '';
+  return {
+    ok: true,
+    summary: `поиск · ${a.pattern} (${matches.length}${truncated ? '+' : ''})`,
+    output: body + note
+  };
+}
+
 async function readFile(a, ctx) {
   if (!a.path) throw new Error('read_file requires "path".');
   const abs = resolveInWork(ctx, a.path);
@@ -80,9 +116,16 @@ async function readFile(a, ctx) {
   if (extract.isBinaryDoc(abs)) {
     return extractFile(a, ctx);
   }
-  const buf = await fsp.readFile(abs, 'utf-8');
-  const out = buf.length > MAX_READ_BYTES ? buf.slice(0, MAX_READ_BYTES) + '\n…(truncated)' : buf;
-  return { ok: true, summary: `read ${a.path} (${buf.length} B)`, output: out || '(empty file)' };
+  // Line-numbered, range-aware read: small files come back whole, large ones are
+  // head/tail-trimmed unless offset/limit is given — so the model reads targeted
+  // ranges (after search_files) instead of flooding context with whole files.
+  const r = await fileSearch.readFileRanged(a, ctx.store.get('workingDir'));
+  let out = r.text || '(empty file)';
+  if (out.length > MAX_READ_CHARS) out = out.slice(0, MAX_READ_CHARS) + '\n…(truncated — use offset/limit to read the rest)';
+  const range = r.shownFrom
+    ? ` [строки ${r.shownFrom}-${r.shownTo}/${r.total}]`
+    : ` (${r.total} строк${r.truncated ? ', обрезан' : ''})`;
+  return { ok: true, summary: `read ${a.path}${range}`, output: out };
 }
 
 // Pull plain text out of a document/binary (PDF, DOCX, PPTX, XLSX, ODF, EPUB,
@@ -495,6 +538,7 @@ async function runSubagentTool(a, ctx) {
  * ------------------------------------------------------------------------ */
 const str = (description) => ({ type: 'string', description });
 const bool = (description) => ({ type: 'boolean', description });
+const int = (description) => ({ type: 'integer', description });
 
 /**
  * @typedef {Object} ToolDef
@@ -520,13 +564,30 @@ const DEFS = [
     run: (_a, ctx) => pickFolder(ctx) },
 
   { name: 'list_files', group: 'fs', readOnly: true, needsWork: true,
-    description: 'List files and directories at a path (relative to the working folder).',
-    parameters: { path: str('Relative path; defaults to the folder root.') },
+    description: 'List the workspace. Without "glob" it lists one directory level; with a glob (e.g. "**/*.js") it returns a recursive list of files matching the pattern. Ignores node_modules/.git/dist/build and respects .gitignore.',
+    parameters: {
+      path: str('Relative path; defaults to the folder root.'),
+      glob: str('Optional glob for a recursive file listing (e.g. "**/*.js", "src/**/*.ts").')
+    },
     run: listFiles },
 
+  { name: 'search_files', group: 'fs', readOnly: true, needsWork: true,
+    description: 'Grep file contents by regular expression across the working folder (ripgrep under the hood). Returns matching "file:line: content". Use this FIRST to locate the relevant code, then read only that range with read_file — do not read whole files to find something. Ignores node_modules/.git/dist/build.',
+    parameters: {
+      pattern: str('Regular expression to search for.'),
+      path: str('Sub-directory to search in (relative to the working folder). Defaults to the whole folder.'),
+      glob: str('Optional file filter, e.g. "*.ts" or "src/**/*.js".'),
+      case_sensitive: bool('Match case exactly. Default false (case-insensitive).')
+    }, required: ['pattern'],
+    run: searchFiles },
+
   { name: 'read_file', group: 'fs', readOnly: true, needsWork: true,
-    description: 'Read a file. Always read a file before editing or overwriting it. For documents (PDF, DOCX, PPTX, XLSX, …) it automatically extracts the text instead of returning raw bytes.',
-    parameters: { path: str('Relative path to the file.') }, required: ['path'],
+    description: 'Read a text file, with line numbers. Files under 300 lines come back whole; larger files return the first 150 + last 50 lines unless you pass offset/limit. Prefer search_files first to find the exact lines, then read just that window with offset/limit — do not read a large file in full unless you truly need all of it. Always read a file before editing it. For documents (PDF, DOCX, PPTX, XLSX, …) it auto-extracts the text instead of raw bytes.',
+    parameters: {
+      path: str('Relative path to the file.'),
+      offset: int('Line number to start reading from (1-based).'),
+      limit: int('How many lines to read from offset (default 200).')
+    }, required: ['path'],
     run: readFile },
 
   { name: 'extract_file', group: 'fs', readOnly: true, needsWork: true,

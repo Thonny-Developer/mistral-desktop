@@ -18,6 +18,13 @@ const tools = require('./tools');
 
 const MAX_TURNS = 16; // hard cap so a misbehaving model can't loop forever
 
+// Context-trimming knobs. We fold bulky old tool outputs to keep the window
+// small, but do it in BATCHES so the cached prefix isn't rewritten every turn.
+const KEEP_TOOL_RESULTS = 8;  // most-recent tool outputs always kept verbatim
+const FOLD_BATCH = 8;         // only fold once this many old ones have piled up
+const FOLD_MIN_LEN = 1500;    // only bother folding results larger than this
+const FOLDED_TEXT = '[прежний вывод инструмента свёрнут для экономии контекста]';
+
 // Permission metadata now lives with the tools themselves (single source of
 // truth). The agent loop only asks the registry which confirmation a call
 // needs and which tools count as "mutating" for the planning gate.
@@ -33,20 +40,39 @@ function stripTags(text) {
 }
 
 /**
- * Build a copy of the transcript for sending, eliding large outputs from older
- * tool results so the context doesn't balloon over many turns. The last few
- * tool results (recent grounding) are kept intact.
+ * Fold bulky old tool outputs IN PLACE to keep the context from ballooning,
+ * while protecting the prompt cache. A naive "elide everything but the last N"
+ * pass rewrites a different message on every turn as the window slides, which
+ * invalidates the cached prefix from that point each time. Instead we only act
+ * once a whole batch of foldable results has accumulated, then fold them all at
+ * once — so the transcript is rewritten rarely (≈ once per FOLD_BATCH turns) and
+ * each message, once folded, never changes again. The most-recent
+ * KEEP_TOOL_RESULTS are always kept verbatim for grounding.
  */
-function pruneForSend(work) {
-  const toolIdx = [];
-  work.forEach((m, i) => { if (m.role === 'tool') toolIdx.push(i); });
-  const keep = new Set(toolIdx.slice(-8));
-  return work.map((m, i) => {
-    if (m.role === 'tool' && !keep.has(i) && (m.content || '').length > 1500) {
-      return { ...m, content: '[прежний вывод инструмента свёрнут для экономии контекста]' };
-    }
-    return m;
-  });
+function foldOldToolOutputs(work) {
+  const foldable = [];
+  let seenFromEnd = 0;
+  for (let i = work.length - 1; i >= 0; i--) {
+    if (work[i].role !== 'tool') continue;
+    seenFromEnd++;
+    if (seenFromEnd <= KEEP_TOOL_RESULTS) continue;      // recent → keep verbatim
+    if (work[i].content === FOLDED_TEXT) continue;        // already folded
+    if ((work[i].content || '').length > FOLD_MIN_LEN) foldable.push(i);
+  }
+  if (foldable.length < FOLD_BATCH) return;               // wait for a full batch
+  for (const i of foldable) work[i] = { ...work[i], content: FOLDED_TEXT };
+}
+
+/**
+ * The message array to send this turn: the working transcript with the freshly
+ * rebuilt live-state block appended as the final message. Keeping live state at
+ * the tail (rather than in the leading system prompt) means todos/folder/memory
+ * changing mid-run never disturbs the cached instruction+history prefix.
+ */
+function withLiveState(work, liveState) {
+  if (!liveState) return work;
+  const content = liveState();
+  return content ? [...work, { role: 'system', content }] : work;
 }
 
 /**
@@ -82,7 +108,10 @@ function sanitizeRequestBody(body) {
 /**
  * Run the loop.
  * @param {Object}   o
- * @param {Array}    o.baseMessages    Full message array (incl. system prompts).
+ * @param {Array}    o.baseMessages    Leading system + transcript (static prefix).
+ * @param {Function} [o.liveState]     () => string; live-state block appended to
+ *                                     the tail of every request (kept out of the
+ *                                     cached prefix). Optional.
  * @param {Object}   o.settings
  * @param {string}   o.apiKey
  * @param {AbortSignal} o.signal
@@ -90,7 +119,7 @@ function sanitizeRequestBody(body) {
  * @param {Function} o.requestApproval (payload) => Promise<boolean>.
  * @param {Object}   o.ctx             Tool context ({ store, getWindow, appendMemory, signal }).
  */
-async function run({ baseMessages, settings, apiKey, signal, emit, requestApproval, ctx, allowedTools }) {
+async function run({ baseMessages, liveState, settings, apiKey, signal, emit, requestApproval, ctx, allowedTools }) {
   const work = [...baseMessages];
   const mode = settings.aiPermissionMode || 'default';
   const ask = requestApproval || (async () => true);
@@ -179,9 +208,10 @@ async function run({ baseMessages, settings, apiKey, signal, emit, requestApprov
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     let text = '';
     let result;
+    foldOldToolOutputs(work); // batch-fold bulky old outputs (rarely; cache-safe)
     try {
       result = await mistral.sendMessage({
-        messages: pruneForSend(work),
+        messages: withLiveState(work, liveState),
         settings,
         apiKey,
         signal,

@@ -133,6 +133,29 @@ function createReasoningFlattener() {
   };
 }
 
+// Models that accept the `reasoning_effort` request parameter. Mistral small &
+// medium (2506 / 2508 and their -latest aliases) expose adjustable reasoning; the
+// value is only "high" (emit a thinking chunk before the answer) or "none".
+// Magistral reasons natively and must NOT receive this parameter.
+const REASONING_EFFORT_RE = /^mistral-(small|medium)/i;
+// Broader probe used only to warn (dev) when a renamed/custom alias looks like a
+// small/medium Mistral model but slipped past the anchored pattern above — so a
+// silent "no reasoning_effort" doesn't have to be debugged blind later.
+const REASONING_LIKELY_RE = /mistral.*(small|medium)|(small|medium).*mistral/i;
+
+/** Map the app's reasoning level to Mistral's reasoning_effort, or null when the
+ *  model doesn't support it. Only "none" and "high" are valid API values. */
+function reasoningEffortFor(model, level) {
+  const name = model || '';
+  if (!REASONING_EFFORT_RE.test(name)) {
+    if (REASONING_LIKELY_RE.test(name)) {
+      console.warn(`[mistral] "${name}" looks like a small/medium reasoning model but did not match REASONING_EFFORT_RE — reasoning_effort not sent. Update the pattern if this alias should reason.`);
+    }
+    return null;
+  }
+  return level === 'low' ? 'none' : 'high';
+}
+
 /** Build a tagged error so the renderer can branch on `.code`. */
 function apiError(message, code) {
   const err = new Error(message);
@@ -442,6 +465,7 @@ async function sendMessage({ messages, settings, apiKey, onToken, signal, tools,
   const qualitySettings = QUALITY_SAMPLING[qualityMode] || QUALITY_SAMPLING.medium;
 
   const hasTools = Array.isArray(tools) && tools.length > 0;
+  const toolNames = new Set((tools || []).map((t) => t?.function?.name).filter(Boolean));
   // Tool-using turns want determinism over creativity — cap the temperature so
   // file paths, edits and commands come out predictable run-to-run.
   const temperature = hasTools
@@ -467,6 +491,13 @@ async function sendMessage({ messages, settings, apiKey, onToken, signal, tools,
   // max_tokens is optional — only send a positive integer.
   const maxTokens = parseInt(settings.maxTokens, 10);
   if (Number.isFinite(maxTokens) && maxTokens > 0) body.max_tokens = maxTokens;
+
+  // Native reasoning: ask supported models (small / medium) to emit a thinking
+  // chunk before the answer. The stream then carries structured thinking/text
+  // chunks the flattener separates by type — no prompt-level "<details>"
+  // convention needed. Driven by the Reasoning setting (low → none, else high).
+  const effort = reasoningEffortFor(model, qualityMode);
+  if (effort) body.reasoning_effort = effort;
 
   // Server-side prompt caching (Mistral cloud only): a stable per-conversation
   // key lets the API reuse the fixed instruction+tools prefix across turns and
@@ -499,16 +530,21 @@ async function sendMessage({ messages, settings, apiKey, onToken, signal, tools,
     const data = await res.json();
     const msg = data?.choices?.[0]?.message || {};
     const flat = createReasoningFlattener();
-    const content = flat.push(msg.content) + flat.flush();
+    let content = flat.push(msg.content) + flat.flush();
+    const nativeCalls = (msg.tool_calls || []).map((tc, i) => parseToolCall(tc.id || `call_${i}`, tc.function?.name, tc.function?.arguments));
+    // Pull any tool calls the model leaked into the text back out (see
+    // recoverLeakedToolCalls) before showing/returning the content.
+    const rec = recoverLeakedToolCalls(content, toolNames);
+    content = rec.content;
     if (onToken && content) onToken(content);
-    const toolCalls = (msg.tool_calls || []).map((tc, i) => parseToolCall(tc.id || `call_${i}`, tc.function?.name, tc.function?.arguments));
+    const toolCalls = [...nativeCalls, ...rec.calls];
     const rateLimit = extractRateLimitInfo(res.headers);
     return { content, toolCalls, usage: data?.usage || null, rateLimit };
   }
 
   // Streaming path: parse SSE frames as they arrive. The watch is cleared the
   // moment the first body chunk lands (model has begun producing output).
-  return await parseSSE(res, onToken, watch);
+  return await parseSSE(res, onToken, watch, toolNames);
 }
 
 /** Finalise an accumulated tool call: parse its JSON arguments (or flag error). */
@@ -520,8 +556,109 @@ function parseToolCall(id, name, rawArgs) {
   return { id, name, args, rawArguments: raw, error };
 }
 
+/* ---------------- leaked tool-call recovery ---------------- */
+// Some models (and local servers) emit Mistral's tool-call format as plain text
+// in `content` instead of the structured tool_calls field. Left alone it renders
+// as garbage like `search_files{…}` in the chat and the call never runs.
+const TOOL_CALL_MARKER = '[TOOL_CALLS]';
+const MAX_LEAKED_CALLS = 32; // a leaking model can loop forever — cap what we execute
+
+const tryParseJson = (s) => { try { return JSON.parse(s); } catch { return null; } };
+const argString = (a) => (typeof a === 'string' ? a : JSON.stringify(a ?? {}));
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * From `str[start]` (which must equal `open`), return the balanced bracketed
+ * substring up to the matching `close`, honouring quoted strings and escapes.
+ * @returns {{value:string|null, end:number}} `end` is just past the close.
+ */
+function sliceBalanced(str, start, open, close) {
+  if (str[start] !== open) return { value: null, end: start };
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < str.length; i++) {
+    const ch = str[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === open) depth++;
+    else if (ch === close) { depth--; if (depth === 0) return { value: str.slice(start, i + 1), end: i + 1 }; }
+  }
+  return { value: null, end: str.length };
+}
+
+/** Dedupe (by name+args) and cap a list of recovered calls. */
+function dedupeCalls(calls) {
+  const seen = new Set();
+  const out = [];
+  for (const c of calls) {
+    const key = `${c.name} ${c.rawArguments}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(c);
+    if (out.length >= MAX_LEAKED_CALLS) break;
+  }
+  return out;
+}
+
+/**
+ * Recover tool calls a model/server leaked into the text `content` instead of
+ * the structured tool_calls field. Seen in the wild:
+ *   [TOOL_CALLS][{"name":…,"arguments":…}, …]   (JSON-array form)
+ *   [TOOL_CALLS]name[ARGS]{json}                (Mistral "tekken" markers)
+ *   startname{json}startname{json}…             (a reasoning model's invented DSL)
+ *   name<glyph>{json}                           (special token detokenised to a glyph)
+ * All but the array form are recovered by one anchor: a REAL tool name followed
+ * (after optional junk — a marker, a "start" token, whitespace or a stray glyph)
+ * by a JSON object that actually parses. That keeps ordinary prose untouched.
+ * Returns the content with the whole leaked tail removed + the parsed calls.
+ *
+ * @param {string} content
+ * @param {Set<string>} [toolNames]  Known tool names — required to anchor the scan.
+ */
+function recoverLeakedToolCalls(content, toolNames) {
+  if (!content || !toolNames || !toolNames.size) return { content, calls: [] };
+
+  // JSON-array form first — the tool name lives INSIDE the array, not before a
+  // brace, so the generic scan below can't see it.
+  const mark = content.indexOf(TOOL_CALL_MARKER);
+  if (mark !== -1) {
+    const afterWs = content.slice(mark + TOOL_CALL_MARKER.length).replace(/^\s+/, '');
+    if (afterWs.startsWith('[')) {
+      const { value } = sliceBalanced(content, content.length - afterWs.length, '[', ']');
+      const arr = value && tryParseJson(value);
+      if (Array.isArray(arr)) {
+        const calls = arr.filter((c) => c && c.name).map((c, i) => parseToolCall(c.id || `leak_${i}`, c.name, argString(c.arguments)));
+        if (calls.length) return { content: content.slice(0, mark).replace(/\s+$/, ''), calls: dedupeCalls(calls) };
+      }
+    }
+  }
+
+  // Generic scan: <optional junk marker/"start"><toolName><optional [ARGS] or one
+  // stray glyph or space>{ … } — collected repeatedly. The leaked calls always
+  // trail the turn, so the cut runs from the first parseable one to the end.
+  const names = [...toolNames].sort((a, b) => b.length - a.length).map(escapeRe).join('|');
+  const re = new RegExp(`(?:\\[TOOL_CALLS\\]|\\bstart)?\\s*(${names})\\s*(?:\\[ARGS\\])?\\s*(?:[^\\w\\s{]\\s*)?\\{`, 'g');
+  const calls = [];
+  let firstIdx = -1;
+  let m;
+  while ((m = re.exec(content))) {
+    const braceAt = m.index + m[0].length - 1; // m[0] ends at the '{'
+    const { value, end } = sliceBalanced(content, braceAt, '{', '}');
+    if (!value || tryParseJson(value) == null) { re.lastIndex = braceAt + 1; continue; }
+    if (firstIdx === -1) firstIdx = m.index;
+    calls.push(parseToolCall(`leak_${calls.length}`, m[1], value));
+    re.lastIndex = end;
+  }
+  if (calls.length) return { content: content.slice(0, firstIdx).replace(/\s+$/, ''), calls: dedupeCalls(calls) };
+  return { content, calls: [] };
+}
+
 /** Read the SSE body, emit text deltas via onToken, accumulate tool calls. */
-async function parseSSE(res, onToken, watch) {
+async function parseSSE(res, onToken, watch, toolNames) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder('utf-8');
   let buffer = '';
@@ -589,16 +726,20 @@ async function parseSSE(res, onToken, watch) {
       // close any reasoning block we were mid-way through so it isn't orphaned.
       const tail = flat.flush();
       if (tail) { full += tail; if (onToken) onToken(tail); }
+      const rec = recoverLeakedToolCalls(full, toolNames);
       const rateLimit = extractRateLimitInfo(res.headers);
-      return { content: full, toolCalls: finalize(), usage, aborted: true, rateLimit };
+      return { content: rec.content, toolCalls: [...finalize(), ...rec.calls], usage, aborted: true, rateLimit };
     }
     throw apiError(`Stream error: ${e.message}`, 'network');
   }
 
   const tail = flat.flush(); // close a block left open if the stream ended mid-thought
   if (tail) { full += tail; if (onToken) onToken(tail); }
+  // Recover any tool calls the model leaked as text (see recoverLeakedToolCalls)
+  // so they run and never linger in the stored content.
+  const rec = recoverLeakedToolCalls(full, toolNames);
   const rateLimit = extractRateLimitInfo(res.headers);
-  return { content: full, toolCalls: finalize(), usage, rateLimit };
+  return { content: rec.content, toolCalls: [...finalize(), ...rec.calls], usage, rateLimit };
 }
 
 /**
@@ -774,5 +915,6 @@ module.exports = {
   sendStructured,
   fimComplete,
   listModels,
-  testConnection
+  testConnection,
+  recoverLeakedToolCalls // exported for unit tests
 };
